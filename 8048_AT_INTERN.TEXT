@@ -1,0 +1,1499 @@
+ 8048 AT INTERN 1503099
+========================
+
+Commented Intel 8048 disassembly of the IBM 84-key Model F (AT) keyboard ROM
+
+                 A. Tarpai 2018
+ (Questions & comments are welcome to tarpai76 at gmail)
+         This file has been downloaded from
+    http://www.halicery.com/8042/8048_AT_INTERN.TEXT
+
+
+
+References 
+==========
+
+1. The file "1503099.m5" is from the MAME project
+2. IBM 5170 AT and 5150 XT Technical Reference
+3. kbdbabel.org
+4. US4305135: PROGRAM CONTROLLED CAPACITIVE KEYBOARD VARIABLE THRESHOLD SENSING SYSTEM (1979)
+5. UPI App?
+6. Disassemblied by my UPI/MCS-48 disassembler/simulator (maybe released sometime)
+
+
+Schematics
+==========
+
+Unfortunately IBM did not provide schematics for the 84-key AT keyboard in the Ref Manuals, but thanks to kbdbabel.org there is one. That and the 83-Key Type-2 Keyboard schematics, which is very similar, helped to confirm some details of the operation. The firmware has been written around this hardware: 
+
+	                                                8 col
+	                                         -+-+-+-+-+-+-+-+-    
+	                                         -+-+-+-+-+-+-+-+-    
+	                 __   +-------+          -+-+-+-+-+-+-+-+-    
+	 +- DB7 -------> EN   |       |          -+-+-+-+-+-+-+-+-    
+	 |                    |4-to-16|  drive   -+-+-+-+-+-+-+-+-    
+	 +- DB6               |  DCD  | ------>  -+-+-+-+-+-+-+-+- 16 row
+	 +- DB4 ----> select  |       |          -+-+-+-+-+-+-+-+-
+	 +- DB5               +-------+          -x-+-+-+-+-+-+-+- 
+	 +- DB3                                  -+-+-+-+-+-+-+-+- 
+	 |                                       -+-+-+-+-+-+-+-+-
+	 |                                       -+-+-+-+-+-+-+-+-
+	 |                                        
+	 |                                        | | | | | | | | 
+	 +- DB2                              +-----------------------+
+	 +- DB1 ------------------> select   |    SENSE AMPLIFIER    |
+	 +- DB0                      _____   |        MUX IC         |
+	 |        +--------------->  RESET   +-----------------------+
+	 |        |                                      | Q out
+	 |        |                                      |
+	 |        |                                    _
+	 |        |                                     \____ low
+	 |        |                                                                     
+	 |        |                                      |               +5V            
+	 |        |                                      |                |              
+	 |        |                                +-->--+                +--INV------->----+
+	 |        |                                |     |                |                 |
+	+------------------------------------------------------------------------+          |
+	| BUS    P10                              P11    T1              P27  T0 | <---INV--+-------  KB DATA
+	|                     8048                                               |          
+	|                 MICROCOMPUTER          P22 P21 P20             P26  INT| <---INV--+-------  KB CLK 
+	+------------------------------------------------------------------------+          |
+	                                          |   |   |               |                 |
+	                                             LEDS                 +--INV------->----+
+	                                                                  |
+	                                                                 +5V  
+
+Keys are located in a 16 x 8 = 128 keyboard matrix with 16 drive and 8 sense lines, lets say 16 rows by 8 columns. The 8048 scans the matrix in a loop by selecting and driving a pulse on one row, while selecting and reading the state of one column at a time. Both the drive- and sense select outputs are connectet to BUS through decoder logic. 
+
+The Model F keyboard has capacitive switches, each button is a variable capacitor. There is a custom made, analogue IC on the board, the silver shielded SENSE AMPLIFIER (SA), which can measure capacitance and decides whether the button is released or depressed (i.e. actuated). Unfortunately, this IC is undocumented, but there are some clues in several US patents filed by IBM from the '70s how it might work and what it does (see US4305135). According to schematics in IBM Ref Man the 83-Key Type-2 Keyboard also used a similar or same SA. 
+
+It as an 8-channel multiplexer and a current sense amplifier with variable threshold. The 3 select lines have a double purpose: in RESET mode pulling Q high resets the input select latch, while pulling RESET high latches the threshold value for the comparator between 0..7. In amplification mode (RESET high), when a small current peak is above threshold on the selected input, it outputs low on Q. It seems like the output appears after a positive drive pulse (discharge). 
+
+SENSE AMPLIFIER timing. The following fig is an attempt to describe this mysterious IC based on how the 8048 controls it: 
+
+	                                           read Q
+	                                           
+	          1    2    3    4        6    7     8
+	          |    |    |    |   NOP  |    |     |
+	    ______                         ____|_____|______
+	P10       \_______________________/    |     |         SA RESET
+	                                       |     |
+	    ______           __________________|_____|______
+	P11 ______\_________/                  |  \__|______   SA CLOSED  <---> Q OUT (T1)
+	                                       |
+	    ___________                        |____________   ________
+	DB7            \_______________________/               DRIVE EN (*)
+	                _______________________
+	    ___________/                       \____________   One Drive Line (follows DB7)
+	    
+	    ___________ _________ __________________________
+	BUS ___________X_________X__________________________
+	                                                    
+	              mux       thr  
+	              
+	(*) Thanks to Kurz. When DB7 is H it inhibits all drive lines (low). When DB7 falls one of the drive outputs goes high. 
+
+The 8048 executes this sequence for each sensor, writing DB0_2 twice: 
+
+1. Pull SA RESET and Q low. 
+2. Write BUS: SENSE SELECT on DB0_2. DRIVE SELECT on DB3_6 and clears DRIVE EN DB7: charge pulse on one drive line. 
+3. Pull Q high: mux address latched by SA. 
+4. Write BUS with same DB3_7 but with a threshold value from a table in ROM on DB0_2. 
+5. NOP..
+6. Pull SA RESET high: threshold value is latched for the comparator, amplification enabled. 
+7. Set DB7 high, DRIVE disable (discharge): drive pulse goes low. SA amplifies the current pulse and compares it to threshold. 
+8. Sample Q output on T1 for low (=SA CLOSED, depressed button). 
+
+
+The matrix scanning loop
+========================
+
+For each 16 rows the 8048 reads all 8 columns and records the row status in a byte. This is compared against the previous row status with XOR, stored in RAM, the result is the Diff Word. Each bit in the Diff Word means a changed sensor state, either a depressed- or released key. The code will put make- and/or breakcodes in the FIFO for each change. After that the row status is updated in RAM, a scancode is transmitted serially to the Host and the 8048 scans the next row. 
+
+A little XOR math and how the code uses it. XOR compares two values (new XOR old) and gives one-s where bits are different. This is the Diff Word. Using XOR again will restore new. Now we have the new value and a change pattern. Later the code checks every bit of the Diff Word: if it's a one, it has been changed and the new value tells us how. When these two are the same the Diff Word (R6) is zero and no further steps has to be made: 
+
+	          0 0 0 0 0 0 1 0    new
+	  XOR     0 1 0 0 0 0 0 0    old
+	--------------------------
+	          0 1 0 0 0 0 1 0    diff = new XOR old (Diff Word)
+	            |         |
+	          release    push
+	            |         |
+	  XOR     0 1 0 0 0 0 0 0    old
+	--------------------------
+	          0 0 0 0 0 0 1 0    new = diff XOR old ---> store in Map
+
+
+84-Key AT Scancodes
+===================
+
+The 84-key IBM keyboard sends one-byte makecodes (84 + 1 overrun code 00) and F0 for breakcode followed by the makecode. It's been told that scancodes are referring to the keyboard matrix scanning process and physical locations of keys located in the matrix. Well, this firmware doesn't send real scancodes as makecodes, i.e. makecodes are not equal to physical locations (only some are). The process in the firmware is as follows:
+
+	  7   6   5   4   3   2   1   0
+	+---+---+---+---+---+---+---+---+
+	| 0 |      row      |    col    |
+	+---+---+---+---+---+---+---+---+
+	         |
+	         |
+	  Row/Col 7-bit                 Internal                8-bit             Key Numbers as
+	   coordinate                   FIFO code               makecode          in IBM Ref Man
+	                                                              
+	   +--------+                  +--------+                     
+	00 |        | ------.          | XXXXXX |              80 --> 00      
+	01 |        |       `------->  |        | 01           01 --- 01               74
+	.. |        |                  |        | 02           02 --> 83               73
+	.. |        |                  |        | ..           .. --- ..               ..
+	.. |        |                  |        | ..           .. --- ..               ..
+	.. |        |                  |        | ..           .. --- ..               ..
+	4F |        | ------.          |        | 4F           .. --- ..               ..
+	50 | XXXXXX |       `------->  |        | 50           .. --- ..               ..
+	   +--------+                  +--------+              .. --- ..               ..
+	51 |        |                  |        | 51           .. --- ..               ..
+	.. |        | -------------->  |        | ..           .. --- ..               ..
+	.. |        |                  |        | ..           7E --- 7E              100
+	7F |        |                  |        | 7F           7F --> 84              105
+	   +--------+                  +--------+                   
+	                                                      
+	       1                           2                       3                   4
+
+1. The 8048 drives one of the 16 rows and reads the status of one of the 8 columns at a time. This is the 7-bit Row/Col coordinate of the key following positive sensing. 
+2. There is routine that converts this coordinate to a code stored in the FIFO. The value 50h (row 10 column 0) is omitted/skipped in a way that all coordinates less than 50h are added one, meaning code 00 will never placed into the FIFO buffer by this routine. The routine that fills the FIFO also watches for FIFO overrun. The FIFO is 17 bytes in size, but when the last 17th slot of the FIFO is to be filled, this routine throws away the incoming code and places 80h at the end of the FIFO. Eventually, when the FIFO is emptied and all 16 valid scancodes has been sent to the Host, this byte also gets "rotated out" from the FIFO and sent, signaling a FIFO overrun (old IBM PC/XT ringed the Bell to the operator). 
+3. Right before sending, the last routine manipulates again these FIFO codes a little: it changes 80h to 00 (Buffer overrun sent to Host), changes 02 to 83h (KEY_F7, but why) and 7Fh to 84h (KEY_SysRq, the new 84th key, because IBM is funny). 
+4. This is the final "scancode" table defined by IBM for the AT corresponding to Key Numbers:  
+
+ ____  ____      ____  ____  ____  ____  ____  ____  ____  ____  ____  ____  ____  ____  ____  ____  ____      ____  ____  ____  ____ 
+| 70 || 65 |    |  1 ||  2 ||  3 ||  4 ||  5 ||  6 ||  7 ||  8 ||  9 || 10 || 11 || 12 || 13 || 14 || 15 |    | 90 || 95 || 100|| 105|
+|____||____|    |____||____||____||____||____||____||____||____||____||____||____||____||____||____||____|    |____||____||____||____|
+ ____  ____      _______  ____  ____  ____  ____  ____  ____  ____  ____  ____  ____  ____  ____  _______      ____  ____  ____  ____ 
+| 71 || 66 |    |   16  || 17 || 18 || 19 || 20 || 21 || 22 || 23 || 24 || 25 || 26 || 27 || 28 ||       |    | 91 || 96 || 101|| 106|
+|____||____|    |_______||____||____||____||____||____||____||____||____||____||____||____||____||       |    |____||____||____||____|
+ ____  ____      ________  ____  ____  ____  ____  ____  ____  ____  ____  ____  ____  ____  ____|  43   |     ____  ____  ____  ____ 
+| 72 || 67 |    |   30   || 31 || 32 || 33 || 34 || 35 || 36 || 37 || 38 || 39 || 40 || 41 ||            |    | 92 || 97 || 102|| 107|
+|____||____|    |________||____||____||____||____||____||____||____||____||____||____||____||____________|    |____||____||____||____|
+ ____  ____      ___________  ____  ____  ____  ____  ____  ____  ____  ____  ____  ____  _______________      ____  ____  ____  ____ 
+| 73 || 68 |    |     44    || 46 || 47 || 48 || 49 || 50 || 51 || 52 || 53 || 54 || 55 ||      57       |    | 93 || 98 || 103||    |
+|____||____|    |___________||____||____||____||____||____||____||____||____||____||____||_______________|    |____||____||____||    |
+ ____  ____      ______          _______________________________________________________     _     ______      __________  ____ | 108|
+| 74 || 69 |    |  58  |        |                         61                            |   |_|   |  64  |    |    99    || 104||    |
+|____||____|    |______|        |_______________________________________________________|   SAT   |______|    |__________||____||____|
+
+
+
+Based on these investigations and going backwards, we can come up with a table showing keys by their Key Numbers located in the 16x8 matrix (left table). What was more interesting, that it corresponds perfectly with another table, the THRESHOLD TABLE stored in the ROM that is used as a sensitivity threshold level value written to the SA before every switch sensing (right table): 
+
+	                            column                                                                   column                        
+	                                                                                                                                   
+	    |   0      1      2      3      4      5      6      7                   |   0      1      2      3      4      5      6      7
+	row |                                                                    row |                                                     
+	 0  |   74     73     72     71     70     65     []     []               0  |   1      1      1      1      2      1      7      7
+	 1  |   69     68     67     66     16      1     []     []               1  |   1      1      1      1      4      1      7      7
+	 2  |   58     44     []     30     17      2     []     []               2  |   1      1      7      1      2      1      7      7
+	 3  |   []     46     32     31     18      3     []     []               3  |   7      1      1      2      2      1      7      7
+	 4  |   48     47     33     19      5      4     []     []               4  |   1      2      1      1      2      2      7      7
+	 5  |   61     49     34     21     20      6     []     []               5  |   2      2      1      1      4      1      7      7
+	 6  |   51     50     36     35     22      7     []     []               6  |   1      4      3      2      2      1      7      7
+	 7  |   []     52     37     23      8      9     []     []               7  |   7      2      2      2      1      3      7      7
+	 8  |   53     38     24     25     11     10     []     []               8  |   1      2      2      3      1      3      7      7
+	 9  |   54     55     39     40     26     12     []     []               9  |   1      4      3      4      2      1      7      7
+	10  |  SAT     []     41     []     27     13     []     []              10  |   0      7      1      7      2      2      7      7
+	11  |   64     57     43     28     []     14     []     []              11  |   2      2      1      2      7      2      7      7
+	12  |   []     []     []     []     []     []     15     []              12  |   7      7      7      7      7      7      1      7
+	13  |   []     93     []     92     91     []     []     []              13  |   7      1      7      1      1      7      7      7
+	14  |   99    104     98     97    102     96     90     95              14  |   2      1      2      1      1      2      1      3
+	15  |   []    108    103    107    106    101    100    105              15  |   7      1      2      1      1      3      1      3
+	    |                                                                        |
+	
+	                 Physical location of keys                                                   SA threshold values 
+	                       (Key Numbers)                                                            stored in ROM
+    
+Unused crossing points are marked by []. For all these positions the SA is driven with the highest sensitivity threshold: "don't even try to sense anything there", threshold 7. 
+
+All other key positions get a value between 1 and 4, probably due to path length, individual stray capacitance and other unknown electrical reasons. Finetuned for a given board.  
+
+SAT. There is only one position with the lowest threshold zero: the mysterious "SAT" at row 10 column 0, or Row/Col coordinate when R2=50h. I just called it the "Sense Amplifier Test". I was long puzzled by this particular Row/Col coordinate that has special meaning in code: it is checked for being "depressed" at Reset and also in every scanning cycle. It has to be "ON" all the time. If at any time SAT has been "released", the AT Keyboard sends a Diagnostic Failure Code: FD hex. Since there is no 85th key anywhere, there has to be something "inside", and it has to to something with the capacitive sensing nature of these keyboards. I don't have the hardware so I started looking around the Web for some AT keyboard capacitive circuitboard pictures and stumbled upon this: http://kbd.rzw.jp/ibm/model_f_6450200/. Inside the 84-Key Model F there is a small capacitive pad between SPACE and CAPS! On the sense side it is indeed connected to SPACE, F9, F10.., the column 0 keys. So, in my interpretation, this little pair of capacitive pad is used to "validate" the Sense Amplifier, it should always capacitive couple and report as "closed". 
+
+
+Ports of the 8048
+=================
+
+         7        6        5        4       3        2        1        0
+    +--------+--------+--------+--------+--------+--------+--------+--------+
+    | DRIVE  |               DRIVE               |       SENSE              |   DB
+    |  EN    |               SELECT              |       SELECT             |     
+    +--------+--------+--------+--------+--------+--------+--------+--------+
+    
+         7        6        5        4       3        2        1        0
+    +--------+--------+--------+--------+--------+--------+--------+--------+
+    |        |        |        |        |        |        |   Q    | SA     |   P1
+    |        |        |        |        |        |        |        | RESET  |     
+    +--------+--------+--------+--------+--------+--------+--------+--------+
+                                                              |
+                                                              T1
+       
+         7        6        5        4       3        2        1        0
+    +--------+--------+--------+--------+--------+--------+--------+--------+
+    |  DATA  |  CLK   |        |        |        |          LEDS            |   P2
+    +--------+--------+--------+--------+--------+--------+--------+--------+
+        |        |
+       INV      INV
+        |        |
+        O---     O--- 
+        |        |
+       INV      INV
+        |        |
+        T0      INT
+
+
+Simplified flow chart:
+======================
+
+The 8048 runs either in Command Mode or in the normal Scanning Mode. Register R2 guides the flow from the Main Loop that is jumped at either 000D or 004F, this varies a little in code: 
+
+	    7       6        5        4        3        2        1        0     
+	+-------+--------+--------+--------+--------+--------+--------+--------+
+	|   0   |               r o w               |          c o l           | R2 in Scanning Mode 
+	+-------+--------+--------+--------+--------+--------+--------+--------+
+	
+	
+	    7       6        5        4        3        2        1        0     
+	+-------+--------+--------+--------+--------+--------+--------+--------+
+	|   1   |    x   |        |        |        |   x    |   x    |        | R2 in Command Mode
+	+-------+--------+--------+--------+--------+--------+--------+--------+
+	             |                                  |         |      
+	          Waiting                           F5 command  Waiting   
+	          second                            Disable     second    
+	          byte of ED/F3                                 byte of ED
+	          command                                       command
+
+R3 and R5 are also global variables (typematic counter and the typematic scancode, respectively). 
+
+
+                         RESET
+                           |
+                         R2=00
+                           |                              
+000D:     +---->------ Host transmit? ------------> 0011: Receive and --------+
+          |                |                              Process Command     |
+          |                |   MAIN LOOP                                      |
+          |                |                                                  |
+004F:     +---------<---- R2_7?       <---------------------------------------+   
+          |                |
+          |         Transmit one scancode
+          |             from FIFO
+          |                |
+          |                |
+0205:     |           Sample row R2
+          |                |                                                
+          |             changed? ---------+                                 
+          |                |              |                                 
+          |                |          Triple Sense                          
+          |                |        update row state                        
+          |                |              |                                 
+          |                |       For all changed columns
+          |                |              |                                 
+          |                |            Push? ----------------+             
+          |                |              |                   |             
+          |                |              |             Put makecode        
+          |                |              |             into scancode FIFO  
+          |                |              |                   |             
+          |                |              |             Put makecode into R5
+          |                |              |             Load Delay into R3  
+          |                |              |                   |             
+          |                |         Put breakcode            |             
+          |                |       into scancode FIFO         |             
+          |                |              |                   |             
+          |                |          R5 released? --+        |             
+          |                |              |          |        |             
+          |                |              |        Clear R5   |             
+          |                |              |          |        |             
+          |                +-------<------+----------+--------+             
+          |                |                                                
+          |              DEC row                                            
+          |                |                                                
+          +----<---- Not every 4th row?                                        
+          |                |
+          |            R5 set and
+          |           DEC R3 expired? ------+                         
+          |                |                |                         
+          |                |          Put makecode R5                 
+          |                |          into scancode FIFO              
+          |                |                |                         
+          |                |          Load Rate into R3               
+          |                |                |                         
+          |                +----<-----------+
+          |                |                                                
+          |            Wait Timer
+          |                |
+          +------<---------+
+
+
+
+Command Processing
+==================
+  
+                          0011: Process Received     <------------------------------------+
+                                     byte                                                 |
+                                      |                                                   |
+                                 Parity even? ------>-----+                               |
+                                      |                   |                               |
+            +-----------------+---Command byte------------|---------+-----------+         |
+            |                 |                           |         |           |         |
+           >=ED              <ED                          |        =FE         =EE        |
+            |                 |                           |       Resend       Echo       |
+            |            R2 not 11xx xxxx? -------->------+         |           |         |
+            |            not waiting for param?           |         |           |         |
+            |                 |                          NACK       |           |         | 
+            |              R2_1? ----> led param        A = FE    A = $3F     A = EE      |
+            |                 |            |              |         |           |         |
+            |            Rate/Delay     set leds          |         |           |         |
+            |              param           |              +---------+-----------+         |
+            |                 |         clr R2_1                    |                     |
+            |             store in R4      |                        |                     |
+            |                 |            |                        |                     |
+            |                 +------------+               0140: transmit A <----+        |
+            |                        |                              |            |        |
+     R2=1xxx xx1x? ----+          clr R2_6                         inh? ------> RTS? -->--+
+     waiting for led?  |             |                              |                     |
+            |          |          R2_2=0? ---+                     000D                   |
+            |          |             |       |                                            |
+            |          |             |     R2=00                                          |
+            |          |             |       |                                            |
+            |          |             +--<----+                                            |
+            |        R2=00           |                                                    |
+            |      cancel led     @A = 4F                                                 |
+            |          |             |                                                    |
+            +----------+----->-------+                                                    |
+                                     |                                                    |
+                            003F: transmit ACK <----+                                     |
+                                     |              |                                     |
+                                    inh? --------> RTS? ------->--------------------------+
+                                     |               
+                                   JMP @A                                             
+                                     |
+          +------------+-------------+-----------+------------+-----------+--------------+
+          |            |             |           |            |           |              |
+         ED           F3            F4          F5           F6         others          FF
+      Set Leds   Set Rate/Delay   Enable      Disable     Set Default    NOP           Reset
+          |            |             |           |            |           |              |
+      1100 0x10    1100 0x00     0000 0000   1000 0100        |           |              |
+          |            |             |           |            |           |              |
+          |            |             |           +------>   R4=2C         |              |
+          |            |             |                    clear FIFO      |              |
+          |            |             |                        |           |              |
+          |            |             |                    x000 0x00       |              |
+          |            |             |                        |           |              |
+          |            |             +-------------------> clear FIFO     |              |
+          |            |                                      |           |              |
+        000D         000D                                   004F        004F           0000
+.
+
+
+
+Register Bank: RAM map
+======================
+
+	              64 bytes RAM
+	+--------------------------------------------+
+	| $3F         Last scancode sent             |
+	+--------------------------------------------+
+	| $3E                                        |
+	|  ..         16 bytes MATRIX MAP            |
+	| $2F                                        |
+	+--------------------------------------------+
+	| $2E         Triple sense buffer            |
+	| $2D         Triple sense buffer            |
+	+--------------------------------------------+
+	| $2C                                        |
+	|  ..         16+1 byte FIFO scancode buffer |
+	| $1C                                        |
+	+--------------------------------------------+
+	| $1B   R3'    FIFO temp                     |
+	| $1A   R2'    FIFO empty/has data           |
+	| $19   R1'    FIFO temp                     |
+	| $18   R0'    FIFO Pointer              RB1 |
+	+--------------------------------------------+
+	|              STACK                         |
+	+--------------------------------------------+
+	| $07   R7     temp                          |
+	| $06   R6     Diff Word                     |
+	| $05   R5     Last pushed key               |
+	| $04   R4     Stored Typematic Delay/Rate   |
+	| $03   R3     Typematic Loop Counter        |
+	| $02   R2     Row/Col Counter               |
+	| $01   R1     Matrix Map Pointer            |
+	| $00   R0     temp                          |
+	+--------------------------------------------+
+
+
+
+This is a brilliantly written piece of 1K 8-bit code.. 
+
+Opening 1503099.m5
+
+
+>> RESET 
+0000: 23 3F   MOV A,#$3F       ; Release CLK & DATA, turn off all leds
+0002: 3A      OUTL P2,A
+
+>> EXTERNAL INTERRUPT (not used, but in case it accidentally does, DIS I and do a soft RESET)
+0003: 89 FF   ORL P1,#$FF      ; 
+0005: 88 FF   ORL BUS,#$FF     ; 
+
+>> TIMER INTERRUPT (not used, but in case it accidentally does, DIS I and do a soft RESET)
+0007: 35      DIS TCNTI        ; disable timer/counter interrupt
+0008: 15      DIS I            ; disable external interrupt
+0009: 55      STRT T           ; Timer runs continuously and reloaded with #$D2 in the Main Loop
+000A: 27      CLR A
+000B: 24 04   JMP $0104        ; -> run BAT
+
+
+********************************
+**     MAIN LOOP 1            **
+********************************
+
+  ; Checks if Host wants to transmit. If yes, receive transmission and process command/parameter byte. 
+  ; If not, go to Main 2 and handle FIFO if in scanning loop.. otherwise come back here (command loop). 
+  ; Reset also start here after all OK and AA sent.
+
+000D: 34 52   CALL $0152       ; Transmission from Host?
+000F: 76 4F   JF1 $004F        ; no -> go to Main 2
+                                 yes: fall thru and process it
+
+
+************************************
+**      Host Command received     **
+************************************
+
+  ; We get here from above (Main Loop) or with jumps. 
+  ; Checks for valid commands: FF...ED. Two commands has parameter, then R6_6 is set. Then accept these:
+  ;   Set Typematic Rate/Delay (Hex F3) parameter:   0xxx xxxx   (R2 was set to 1100 0x00)
+  ;   Set/Reset Mode Indicators (Hex ED) parameter:  0000 0xxx   (R2 was set to 1100 0x10)
+
+0011: E6 25   JNC $0025        ; Even parity? --> NACK
+
+0013: A8      MOV R0,A         ; Carry = 1 (no parity error): save A to R0, the Command byte
+0014: D3 FE   XRL A,#$FE
+0016: C6 8F   JZ $008F         ; A=FE? -> Resend Command
+0018: F8      MOV A,R0         ; not FE: restore A
+0019: D3 EE   XRL A,#$EE
+001B: C6 CC   JZ $00CC         ; A=EE? -> Echo Command
+001D: F8      MOV A,R0         ; not EE: restore A
+001E: 03 13   ADD A,#$13       ; 
+0020: F6 BF   JC $00BF         ; A>=ED? -> ok, valid command
+0022: FA      MOV A,R2         ; <ED (parameter for ED/F3?)
+0023: F2 29   JB7 $0029        ; R2_7 set? Command in progress? Scanning disabled? -> ok
+                               ; not set: 0xxx xxxx -> NACK
+0025: 23 FE   MOV A,#$FE       ; 
+0027: 24 40   JMP $0140        ; -> Send FE to Host (NACK)
+
+0029: D2 2D   JB6 $002D        ; R2_6 set? Command with parameter (ED/F3) in progress? -> ok
+002B: 04 25   JMP $0025        ; not set: 10xx xxxx -> NACK
+
+002D: F8      MOV A,R0         ; ok, (ED/F3) in progress, R2 = 11xx xxx: restore A<-R0 
+002E: 2A      XCH A,R2
+002F: 32 8C   JB1 $008C        ; R2_1 set? ok, Set/Reset Mode Indicators parameter -> 
+0031: 2A      XCH A,R2         ; no, Typematic Rate/Delay parameter
+0032: F2 25   JB7 $0025        ; bit7 set? err -> NACK (Typematic Rate/Delay parameter should have b7=0)
+0034: AC      MOV R4,A         ; ok, we got a Typematic Rate/Delay parameter: store in R4.. and end command
+
+>> JMP also after set leds or typematic command finished
+0035: FA      MOV A,R2
+0036: 53 BF   ANL A,#$BF       ; clear bit6 of R2 (end ED/F3 sequence, parameter received)
+0038: 52 3C   JB2 $003C        ; test bit2 of R2: Under Disabled command?
+003A: 53 7F   ANL A,#$7F       ; no, clear bit7 too (enable scanning/command processing)
+003C: AA      MOV R2,A         ; write R2 00xx xxxx
+003D: B8 FE   MOV R0,#$FE      ; just pick a pointer for @A (->4F for Main), fall through and ACK it:
+
+
+*****************************************************
+**  JMP: Send ACK (FA) to Host and jump indirect   **
+*****************************************************
+
+  ; Attempts transmission. If Host inhibits (F1=1) check if Host wants to send data: receive and process if yes, otherwise try transmission again. 
+  ; Similar to 0140 but the exit is different: indirect jump from table based on command byte. 
+  ;           
+  ;   transmit FA (ACK) <----+
+  ;         |                |
+  ;        inh? ----------> RTS? --> receive and process
+  ;         |
+  ;        JMP @A       
+
+003F: F8      MOV A,R0
+0040: AE      MOV R6,A         ; R0 -> R6 (save original command in R6)  
+
+0041: 23 FA   MOV A,#$FA
+0043: 34 83   CALL $0183       ; Transmit FA (ACK) to Host
+0045: 76 49   JF1 $0049        ; inhibit? -> receive if any
+0047: FE      MOV A,R6         ; no, transmission ok: load command byte
+0048: B3      JMP @A           ; and -> indirect JMP from COMMAND TABLE
+
+0049: 34 52   CALL $0152       ; Host inhibited our transmission: Host wants to transmit?
+004B: 76 41   JF1 $0041        ; F1=1: no, just inhibited -> try again
+004D: 04 11   JMP $0011        ; F1=0: yes, got a byte -> check parity and process command
+
+
+
+*****************************************
+**          MAIN LOOP 2                **
+**   If scanning mode                  **
+**   Send scancode from FIFO to Host   **
+*****************************************
+
+  ; JMP from many places: 
+  ; After RESET R2=00, FIFO empty -> starts Scanning Loop
+  ; From Main 1, F1=1, Host idle 
+  : After command processing
+  ; It jumps back to Main 1 in command mode (R2_7 set) 
+
+004F: FA      MOV A,R2         ; 
+0050: F2 0D   JB7 $000D        ; R2 bit7 set? Scancode sending (and scanning) Disabled -> go to Main 1
+                               ; not set: fall thru and Send scancode from FIFO to Host if any.. then go to Scanning Loop
+
+***********************************************
+**  Send one scancode from FIFO to Host      **
+***********************************************
+
+  ; If in scanning loop (R2_7=0) and if FIFO has data: send $1C to Host. 
+  ; After makecode SHIFT FIFO, after breakcode just send F0 and clear bit7 of $1C. 
+
+0052: D5      SEL RB1          ; 
+0053: FA      MOV A,R2         ; test R2' ($1A)
+0054: 37      CPL A
+0055: F2 77   JB7 $0077        ; $1A bit7 zero? -> FIFO empty, done -> back to SCANNING LOOP
+
+0057: B9 1C   MOV R1,#$1C      ; FIFO not empty: 
+0059: F1      MOV A,@R1        ; read $1C into A
+005A: C5      SEL RB0          ; 
+005B: F2 7A   JB7 $007A        ; -> test bit7 of scancode for key release or 80h (FIFO overrun) 
+005D: D3 02   XRL A,#$02       ; not set: -> check for 02
+005F: 96 65   JNZ $0065        ; not 02: ->
+
+0061: 23 83   MOV A,#$83       ; 02: transmit 83 (KEY_F7)
+0063: 04 71   JMP $0071        ; -> transmit
+
+0065: B8 1C   MOV R0,#$1C      ; not 02:
+0067: F0      MOV A,@R0        ; read $1C into A again
+0068: D3 7F   XRL A,#$7F       ; check for 7F
+006A: 96 70   JNZ $0070        ; -> not 7F
+006C: 23 84   MOV A,#$84
+006E: 04 71   JMP $0071        ; 7F: -> transmit 84 (KEY_SysRq)
+
+0070: F0      MOV A,@R0        ; none of the above:
+0071: 34 83   CALL $0183       ; transmit makecode in A to Host 
+0073: 76 77   JF1 $0077        ; F1=1, Host inhibits? -> done (leave scancode in FIFO, we try again next time we get here) 
+0075: 54 A5   CALL $02A5       ; success: --> SHIFT FIFO BUFFER, done
+
+0077: C5      SEL RB0          ; 
+0078: 44 05   JMP $0205        ; --> back to SCANNING LOOP
+
+007A: D3 80   XRL A,#$80       ; bit7 of FIFO code set: check for FIFO overrun (80), otherwise send breakcode 
+007C: C6 71   JZ $0071         ; 80? -> transmit 00 (FIFO overrun) and done. Byte put into last FIFO slot ($2C)
+007E: 23 F0   MOV A,#$F0       ; not 80: 
+0080: 34 83   CALL $0183       ; Transmit F0 to Host (breakcode)
+0082: 76 77   JF1 $0077        ; F1=1, Host inhibits? done, we try again next time 
+0084: B8 1C   MOV R0,#$1C      ; F1=0: ok
+0086: F0      MOV A,@R0        ; 
+0087: 53 7F   ANL A,#$7F
+0089: A0      MOV @R0,A        ; and just clear bit7 of $1C scancode: we'll send it after F0 next time we get here
+008A: 44 05   JMP $0205        ; done -> back to SCANNING LOOP
+
+
+*********************************
+**       Host Commands         **
+*********************************
+
+>> JB Set/Reset Mode Indicators parameter received:
+008C: 2A      XCH A,R2         ; restore A, received byte
+008D: 44 CD   JMP $02CD        ; -> set leds (then back to command proc)
+
+>> FE Resend Command
+008F: B8 3F   MOV R0,#$3F      ; load last scancode from $3F
+0091: F0      MOV A,@R0
+0092: 24 40   JMP $0140        ; -> Send to Host and continue
+
+>> JMP Echo EE
+0094: 14 9A   CALL $009A       ; -> Cancel param R2 = R2 & 84
+0096: 23 EE   MOV A,#$EE
+0098: 24 40   JMP $0140        ; Send EE back to Host and continue 
+
+>> SUB: clear R2 but keep scanning disable and bit2 enable/disable command: cancels waiting for parameter 
+009A: FA      MOV A,R2
+009B: 53 84   ANL A,#$84
+009D: AA      MOV R2,A         ; R2 = R2 & 84 (x000 0x00)
+009E: 83      RET
+
+>> @A F5 Command (Disable and Set Default)
+009F: BA 84   MOV R2,#$84      ; set R2 to 84: disable scanning, set bit2
+
+>> @A F6 Command (Set Default)
+00A1: 34 00   CALL $0100       ; -> R4=2C (default Typematic Rate/Delay) and Clear kb buffer
+00A3: 14 9A   CALL $009A       ; -> R2 = R2 & 84 (x000 0x00): keep disabled when already disabled, clear pending param 
+00A5: 74 B3   CALL $03B3       ; -> Clear FIFO buffer
+00A7: 04 4F   JMP $004F        ;
+
+>> @A F4 Command (Enable)
+00A9: BA 00   MOV R2,#$00      ; clear R2
+00AB: 04 A5   JMP $00A5        ; -> Clear kb buffer and send scancode
+
+>> @A F3 Command (Set Typematic Rate/Delay)
+00AD: FA      MOV A,R2
+00AE: 53 84   ANL A,#$84
+00B0: 43 C0   ORL A,#$C0
+00B2: AA      MOV R2,A         ; R2 = R2 & 84 | C0 (1100 0x00): disable scanning, command with parameter in progress: F3
+00B3: 04 0D   JMP $000D        ; -> go and check Host (wait for parameter)
+
+>> @A FF Command: RESET
+00B5: 86 B9   JNI $00B9        ; .. wait for CLK released..
+00B7: 04 B5   JMP $00B5        ; 
+00B9: 34 52   CALL $0152       ; CLK released: Host transmit?
+00BB: 76 00   JF1 $0000        ; no  -> ok, SOFT RESET
+00BD: 04 11   JMP $0011        ; yes -> back to Command processing
+
+>> JC: valid Host Command: ED or higher (R0=command, Resend/FE and Echo/EE already tested)
+00BF: FA      MOV A,R2         ; 
+00C0: F2 C4   JB7 $00C4        ; scanning disabled? command in progress?
+00C2: 04 3F   JMP $003F        ; scanning enabled -> Send ACK (FA) to Host and jump indirect @R0
+00C4: 32 C8   JB1 $00C8        ; scanning disabled: set led parameter in progress? 
+00C6: 04 3F   JMP $003F        ; no -> Send ACK (FA) to Host and jump indirect @R0
+00C8: BA 00   MOV R2,#$00      ; yes, cancel set led command waiting for parameter and start scanning after @JMP
+00CA: 04 3F   JMP $003F        ; -> Send ACK (FA) to Host and jump indirect @R0
+
+>> JMP: EE Echo command
+00CC: FA      MOV A,R2         ;
+00CD: F2 D1   JB7 $00D1        ; command in progress? 
+00CF: 04 94   JMP $0094        ;
+00D1: 32 D5   JB1 $00D5        ; yes: Set/Reset Mode Indicators in progress?
+00D3: 04 94   JMP $0094        ;
+00D5: BA 00   MOV R2,#$00      ; yes, cancel command
+00D7: 04 94   JMP $0094        ; -> do Echo
+
+**************************
+**   ROM CHKSUM READ    **
+**************************
+00D9: A3      MOVP A,@A        ; read page-0
+00DA: 44 01   JMP $0201        ; --> and add to R1
+
+00DC: 00      NOP              ; orphan, never executed 
+
+>> @A ED Command Set/Reset Mode Indicators
+00DD: 44 C5   JMP $02C5
+
+
+00DF: 15      DIS I            ; orphan: for ROM checksum to be zero?
+00E0: 00      NOP
+00E1: 00      NOP
+00E2: 00      NOP
+00E3: 00      NOP
+00E4: 00      NOP
+00E5: 00      NOP
+00E6: 00      NOP
+00E7: 00      NOP
+00E8: 00      NOP
+00E9: 00      NOP
+00EA: 00      NOP
+00EB: 00      NOP
+00EC: 00      NOP
+
+**************************************
+**     JUMP TABLE FOR COMMANDS      **
+**************************************
+00ED: DD      -> Set/Reset Mode Indicators + param
+00EE: 4F      -> JMP $004F
+00EF: 4F      -> JMP $004F
+00F0: 4F      -> JMP $004F
+00F1: 4F      -> JMP $004F
+00F2: 4F      -> JMP $004F
+00F3: AD      -> Set Typematic Rate/Delay (Hex F3) + param
+00F4: A9      -> Enable (Hex F4)
+00F5: 9F      -> Disable (Hex F5) 
+00F6: A1      -> Set Default (Hex F6)
+00F7: 4F      -> JMP $004F
+00F8: 4F      -> JMP $004F
+00F9: 4F      -> JMP $004F
+00FA: 4F      -> JMP $004F
+00FB: 4F      -> JMP $004F
+00FC: 4F      -> JMP $004F
+00FD: 4F      -> JMP $004F
+00FE: 4F      -> JMP $004F (after command parameter received)
+00FF: B5      -> Reset (Hex FF)
+
+
+******************************************
+**  Load default Typematic Rate/Delay   **
+**        and clear FIFO                **
+******************************************
+
+>> SUB 
+0100: BC 2C   MOV R4,#$2C      ; R4=2C default Typematic Rate/Delay
+0102: 64 B3   JMP $03B3        ; -> Clear scancode FIFO buffer and return
+
+**************************************
+**     RESET BAT Routine            **
+**************************************
+
+>> JMP 
+0104: 27      CLR A
+0105: D7      MOV PSW,A        ; clear all flags
+0106: 9A F8   ANL P2,#$F8      ; blink all 3 leds: on
+0108: 8A 07   ORL P2,#$07      : off
+
+010A: B8 3F   MOV R0,#$3F      ; Test 64 bytes of RAM and leave all zero 
+010C: 23 FF   MOV A,#$FF       ; ---------------------------+
+010E: A0      MOV @R0,A        ; write ram with ff          |
+010F: D0      XRL A,@R0        ; test: should be zero       |
+0110: 96 4C   JNZ $014C        ; non-zero? -> err           |
+0112: A0      MOV @R0,A        ; write ram with 00          |
+0113: F0      MOV A,@R0        ; read ram                   |
+0114: 96 4C   JNZ $014C        ; non-zero? -> err           |
+0116: E8 0C   DJNZ R0,$010C    ;  --------------------------+
+
+0118: F8      MOV A,R0         ; Test rom: checksum in R1 -----+
+0119: 14 D9   CALL $00D9       ; read rom page-0 and add       |
+011B: 54 00   CALL $0200       ; read rom page-2 and add       |
+011D: A3      MOVP A,@A        ; read rom page-1               |
+011E: 54 01   CALL $0201       ; and add                       |
+0120: E3      MOVP3 A,@A       ; read rom page-3               |
+0121: 54 01   CALL $0201       ; and add                       |
+0123: E8 18   DJNZ R0,$0118    ; ------------------------------+
+0125: F9      MOV A,R1         ; checksum=0? ok (simulator confirmed it too)
+0126: 96 4C   JNZ $014C        ; non-zero? -> disable scanning and send FC
+
+0128: BA 58   MOV R2,#$58      ; checksum=0, ok
+012A: 54 51   CALL $0251       ; -> SENSE AMPLIFIER TEST (SAT, matrix row=10 col=0: the "small pad" between SPACE and CAPS)
+012C: F2 32   JB7 $0132        ; this should always couple and sense as '1' -> SA OK 
+
+012E: 23 FD   MOV A,#$FD       ; bit7 clear: SA ERR, disable scanning.. 
+0130: 24 4E   JMP $014E        ; and send FD = Diagnostic Failure
+
+0132: 34 00   CALL $0100       ; SA OK -> Load R4=2C (default Typematic Rate/Delay) and Clear FIFO 
+
+0134: 23 AA   MOV A,#$AA       ; AA=Self test passed
+0136: BA 00   MOV R2,#$00      ; set R2=00: enable and start scanning
+
+0138: B9 E6   MOV R1,#$E6      ; ------------+
+013A: E8 3A   DJNZ R0,$013A    ; delay loop  |
+013C: E9 3A   DJNZ R1,$013A    ; ------------+
+013E: 9A F8   ANL P2,#$F8      ; leds ON  
+                               ; fall thru and Send AA/FD/FC to Host
+
+
+*******************************************
+**  JMP: Send 'A' to Host and Main Loop  **
+*******************************************
+
+  ; We fall through here from RESET with A = AA/FD/FC.
+  ; Jumped from Command Processing to send reply to Host - also from Scanning Loop with SA Failure: FD.
+  ; Similar to 003F but exit to Main Loop. 
+  ; 
+  ;        transmit A <----+
+  ;             |          |
+  ;            inh? ----> RTS? --> receive and process
+  ;             |
+  ;           MAIN LOOP
+
+0140: 34 83   CALL $0183       ; Transmit A to Host 
+0142: 76 46   JF1 $0146        ; inhibit? -> receive if any
+0144: 04 0D   JMP $000D        ; no, transmission ok --> Main Loop
+0146: 34 52   CALL $0152       ; Host inhibited our transmission: Host wants to transmit?
+0148: 76 40   JF1 $0140        ; F1=1: no, just inhibited -> try again
+014A: 04 11   JMP $0011        ; F1=0: yes, got a byte -> check parity and process command
+
+
+>> JNZ: RAM/ROM error
+014C: 23 FC   MOV A,#$FC       ; err -> send FC= Self test RAM/ROM failed
+014E: BA 84   MOV R2,#$84      ; disable scanning as if Disable Command F5
+0150: 24 38   JMP $0138        ; -> back to delay and send to Host
+
+
+***************************************
+**  SUB: Check for RTS and           **
+**  Receive transmission from Host   **
+***************************************
+
+  ; KB checks for a stable state of CLK released and DATA pulled low: Request-to-send (RTS) state of the bus 
+  ; Host pulls CLK low.. pulls DATA low.. waits 100us.. then releases CLK:
+  ;  __     ____   
+  ; C  \___/
+  ;  __  
+  ; D  \________
+  ; 
+  ; Returns F1=1 if there is nothing (i.e. Host doesn't want to send)
+  ; F1=0 when data successfully received from Host --> it will be processed
+  ; Host writes data when CLK falls, i.e low
+  ; Device clocks in data on rising edges 9 times (8 bit data and parity) 
+
+0152: A5      CLR F1           ; Check if lines are in in RTS-state: makes sure DATA pulled low stable and CLK is released
+0153: 26 57   JNT0 $0157       ; KBD DATA high? set F1 and return
+0155: 86 59   JNI $0159        ; DATA low, check CLK: high? -> ok, check DATA again
+0157: B5      CPL F1           ; no, CLK low: Not RTS -> set F1 and return
+0158: 83      RET
+0159: 26 57   JNT0 $0157       ; DATA low, CLK high: check DATA again, if high -> set F1 and return
+
+015B: 27      CLR A            ; OK, stable RTS-state: DATA low, CLK released. We'll start sampling START BIT below 
+015C: 97      CLR C            ; clear A and Carry, the 9th bit (parity) will rotate into Carry at the end
+015D: B8 0A   MOV R0,#$0A      ; 10 CLK pulses (START BIT already checked, just latch '0' in leaving A and Carry untouched)
+
+015F: 36 62   JT0 $0162        ; Sample DATA (CLK high now) ------------------------------+
+0161: 17      INC A            ; KBD DATA high: rotate '1'                                |
+0162: 67      RRC A            ; KBD DATA low: leave it '0', just rotate                  |
+0163: 00      NOP                                                                         |
+0164: 00      NOP              ; keep CLK high for a little                               |
+0165: 00      NOP                                                                         |
+0166: 24 79   JMP $0179        ; -> next step                                             |
+0168: EF 68   DJNZ R7,$0168    ; delay 3 times with CLK low (let Host write DATA now)     |
+016A: 9A BF   ANL P2,#$BF      ; release CLK, high                                        |
+016C: E8 5F   DJNZ R0,$015F    ; back to sample DATA -------------------------------------+
+
+016E: 76 7F   JF1 $017F        ; OK, data byte in A, parity in Carry. F1 set?
+0170: 18      INC R0           ; F1 zero: set R0=1 and do another loop 
+0171: 26 76   JNT0 $0176       ; check STOP BIT: KBD DATA high? -> ok
+0173: 27      CLR A            ; no, STOP BIT (KBD DATA) low: err! Clear A=0, finish ACK-ing (but set read byte to zero..)
+0174: 24 79   JMP $0179        ; -> next
+
+0176: 8A 80   ORL P2,#$80      ; ok STOP BIT, KBD DATA high: pull it low (ACK)
+0178: B5      CPL F1           ; set F1 for done
+
+0179: 8A 40   ORL P2,#$40      ; pull CLK low
+017B: BF 03   MOV R7,#$03
+017D: 24 68   JMP $0168        ; -> go delay 3 times and back to loop
+
+017F: 9A 7F   ANL P2,#$7F      ; F1=1: finish ACK, release DATA, high and we're done 
+0181: 24 85   JMP $0185        ; -> jump below: check parity with F1=1 
+                                so it comes back with computed parity in Carry
+                                then clears F1 (OK) and return
+              
+ __     ____ | _______    __ | _______    __ |              | _______    __ | _______    __ | ________    _____ |
+C  \___/     |        \__/   |        \__/   |              |        \__/   |        \__/   |         \__/      |   
+ __          |          ____ | ________ ____ |    ......    | ________ ____ | ________ ____ | ____           __ |   done
+D  \________ | ________X____ | ________X____ |              | ________X____ | ________X     |     \_________/   |   receive
+             | ^  NOP        | ^  NOP        |              | ^  NOP        | ^  NOP        | ^       ACK       |
+               |               |                              |               |               |
+             sample          sample                         sample          sample           sample
+             START           BIT0                           BIT7            PARITY           STOP
+                                                                                            
+             R0=10           R0=9                 ......    R0=2            R0=1        
+
+
+******************************
+**  SUB Transmit A to Host  **
+******************************
+
+  ; Host can inhibit transmission by pulling CLK down at any time. In that case we set F1 and just return. 
+  ; KB writes DATA when CLK high - Host reads DATA when CLK low. 
+
+0183: A5      CLR F1           ; F1=0 (will set when Host inhibited our transmission)
+0184: 97      CLR C
+
+  ; JMP-d here also after receiving transmission from Host with F1=1, so it jumps back there (a little code reuse in assembly)
+
+0185: B8 08   MOV R0,#$08      ; Compute Parity into Carry 
+0187: 77      RR A             ; rotate A, do not touch Carry
+0188: 12 8B   JB0 $018B        ; 
+018A: A7      CPL C            ; lsb not set: flip Carry   
+018B: E8 87   DJNZ R0,$0187
+018D: 76 57   JF1 $0157        ; -> jumps back to Receive transmission from Host: clear F1 and return
+
+018F: A7      CPL C            ; Parity in Carry. Check if lines are released: 
+0190: 86 94   JNI $0194        ; KBD CLK released high? ok
+0192: 24 BB   JMP $01BB        ; no, CLK pulled low -> set F1 and return (Host inhibit) 
+0194: 36 BB   JT0 $01BB        ; CLK released ok, is DATA pulled low by Host? -> set F1 and return (Host inhibit) 
+
+0196: B8 0A   MOV R0,#$0A      ; both CLK/DATA released, high: do this 10 times 
+0198: F7      RLC A
+0199: 24 9D   JMP $019D        ; jump into loop for START BIT=0
+
+019B: 12 B7   JB0 $01B7        ; lsb=1: ->                      <--------------+
+019D: 8A 80   ORL P2,#$80      ; lsb=0: pull KBD DATA low                      |
+019F: 86 A3   JNI $01A3        ; check CLK: high? ok                           |
+01A1: 24 BB   JMP $01BB        ; no, CLK pulled low (Host inhibit) -> exit     |        
+01A3: 8A 40   ORL P2,#$40      ; CLK released: pull it low                     |
+01A5: 67      RRC A                                                            |
+01A6: 00      NOP                                                              |
+01A7: BF 02   MOV R7,#$02      ; let Host read DATA..                          |
+01A9: EF A9   DJNZ R7,$01A9    ; loop 2 times                                  |
+01AB: 76 C0   JF1 $01C0        ; F1 set? (we just did STOP BIT?) -> break      |
+01AD: 9A BF   ANL P2,#$BF      ; F1=0: release CLK high                        |
+01AF: 86 B3   JNI $01B3        ; check CLK: high? ok                           |
+01B1: 24 BB   JMP $01BB        ; no, CLK pulled low (Host inhibit) -> exit     |
+01B3: E8 9B   DJNZ R0,$019B    ; ----------------------------------------------+
+
+01B5: 18      INC R0           ; R0=1
+01B6: B5      CPL F1           ; now set F1 for exit from loop above 
+01B7: 9A 7F   ANL P2,#$7F      ; release DATA high
+01B9: 86 A3   JNI $01A3        ; check CLK: high? -> ok
+
+01BB: 9A 7F   ANL P2,#$7F      ; CLK pulled low by Host: release DATA high (CLK is released here by 8048)
+01BD: A5      CLR F1           ; 
+01BE: B5      CPL F1           ; set F1 and return (Host inhibit) 
+01BF: 83      RET
+
+01C0: 9A BF   ANL P2,#$BF      ; F1 set: release CLK high
+01C2: F7      RLC A            ; restore (we RRC A above as part of the loop)
+01C3: D3 FE   XRL A,#$FE       ; A=FE? We've just sent NACK to Host? 
+01C5: C6 CC   JZ $01CC         ; yes: do not remember that code for Resend: just clear F1 (OK) and return 
+01C7: D3 FE   XRL A,#$FE       ; not FE: restore A
+01C9: B8 3F   MOV R0,#$3F
+01CB: A0      MOV @R0,A        ; and store in $3F (as last scancode/byte sent to Host in case Host wants Resend)
+
+01CC: A5      CLR F1           ; clear F1 (OK) and return 
+01CD: 83      RET
+
+ _____ | ______     __ | ______     __ |               | ______     __ | ______     __ | ______     __ | 
+C      |       \___/   |       \___/   |               |       \___/   |       \___/   |       \___/   | 
+ _____ | _             |   ___________ |    .......    | _ ___________ | _ ___________ | _ ___________ |   done
+D      |  \___________ | _X___________ |               | _X___________ | _X___________ | _/            |   transmit
+       |  ^  ^      ^  |  ^  ^      ^  |               |     ^      ^  |     ^      ^  |     ^         | 
+          |  |      |     |  |      |                        |      |        |      |        |           
+          | CLK?   CLK?   | CLK?   CLK?                     CLK?   CLK?     CLK?   CLK?     CLK?           
+          |               |    
+        write            write                                                                 
+        START=1          BIT0                            BIT7           PARITY            STOP 
+        R0=10            R0=9               .......      R0=2           R0=1        
+            
+
+01CE: 00 00 00 00 00 00 00 00 | 00 00 00 00 00 00 00 00 
+      00 00 00 00 00 00 00 00 | 00 00 00 00 00 00 00 00 
+      00 00 00 00 00 00 00 00 | 00 00 00 00 00 00 00 00 
+      00 00
+
+
+**************************
+**   ROM CHKSUM READ    **
+**************************
+0200: A3      MOVP A,@A        ; read page-2 and add to R1
+
+**************************
+**   ROM CHKSUM ADD     **
+**************************
+0201: 69      ADD A,R1         ; add A to R1:
+0202: A9      MOV R1,A         ; R1+=A
+0203: F8      MOV A,R0         ; restore @A pointer from R0
+0204: 83      RET
+
+
+***********************************
+**     SCANNING LOOP             **
+***********************************
+
+  ; Runs when scanning/scancode-sending is enabled (R2_7=0). Records and stores changes of keys (with triple sense). 
+  ; Puts/Sends scancodes from FIFO. Handles typematic (auto repeat). Check for Host transmission after each row. 
+  ; 
+  ; R1 = MATRIX MAP POINTER: counts backwards from 3Eh 
+  ; R2 = Row/Col: it counts backwards from 80h, with pre-decrement, down to zero
+  ; R3 = typematic counter to decrement every 4th row (Rate or Delay)
+  ; R5 = typematic scancode to repeat (every push stored as new R5 and loads Typematic Delay) 
+  ; 
+  ;   07 0F 17 1F 27 2F 37 3F 47 4F 57 5F 67 6F 77 7F  <-- R2 Row/Col  
+  ;   2F 30 31 32 33 34 35 36 37 38 39 3A 3B 3C 3D 3E  <-- R1 MATRIX MAP POINTER
+  ;      |           |           |           |     
+  ;      R5          R5          R5          R5        <-- here we dec typematic counter R3
+  
+  Notes. R5 bit7 is cleared at start of full scan, but never tested after that..(?) This must be a remnant from the XT ROM, where 
+  R3-counter is decremented only once per full scan. Here is different: it's decremented after every 4th row, when R5 has scancode. 
+
+
+0205: FA      MOV A,R2         ; Test Row/Col Counter R2: --------------------------------------+
+0206: 96 10   JNZ $0210        ; R2 non-zero? -> scan next row                                  |
+0208: FD      MOV A,R5         ; R2 reached zero (end of scan):                                 |
+0209: 53 7F   ANL A,#$7F       ;                                                                |
+020B: AD      MOV R5,A         ;   clear bit7 of R5 (0xxx xxxx)                                 |
+020C: B9 3E   MOV R1,#$3E      ;   MATRIX MAP POINTER R1 = 3E                                   |
+020E: BA 80   MOV R2,#$80      ;   R2=80h (dec in sense -> 7F)                                  |
+                                                                                                |
+0210: 54 51   CALL $0251       ; -> scan row (1st sense)                                        |
+0212: 96 7C   JNZ $027C        ; any key pressed? --> go Triple Sense (if not held)             |
+0214: D1      XRL A,@R1        ; no, all released, here A=0.. so we simply load @R1 into A      |
+0215: 96 7F   JNZ $027F        ; 1st sense zero but prev is not? --> go Triple Sense            |
+                               ; no, both zero: just resume..                                   |
+                               ; <---------                                                     |
+                               ; After Triple Sense:                                            |
+                               ; - put make/breakcode(s) into FIFO                              |
+                               ; - push: sets R5 and loads R3 Typematic Delay into R3           |
+                               ; <------ then jump back here                                    |
+0217: F9      MOV A,R1         ;                                                                |
+0218: C9      DEC R1           ; dec R1 matrix map pointer (starts from 3E)                     |
+0219: 12 29   JB0 $0229        ; When bits 0,1 of R1 are set after dec:                         |
+021B: 32 29   JB1 $0229        ; ---> back to Main: check Host + FIFO -- jumps back there -->---+
+                                                                                                |
+021D: FD      MOV A,R5         ; Every 4th row: R1= 3C 38 34 30 (xxxx xx00)                     |
+021E: 53 7F   ANL A,#$7F       ; keep msb of R5 (cleared at start?)                             |
+0220: 96 2B   JNZ $022B        ; test R5: has scancode to repeat? -> yes, jump DEC R3 below     |
+                               ; no, R5 is zero: nothing to repeat                              |
+                                                                                                |
+0222: 16 26   JTF $0226        ; Jump if Timer/Counter Flag is Set -----------------------------|-------------+
+0224: 44 22   JMP $0222        ; wait a little between rows..                                   |             |
+0226: 23 D2   MOV A,#$D2       ; ok, timer expired:                                             |             |
+0228: 62      MOV T,A          ; reload Timer=D2                                                |             |
+0229: 04 0D   JMP $000D        ; ---> Host + FIFO ------------ back there -------->-------------+             |
+                                                                                                              |
+022B: EB 22   DJNZ R3,$0222    ; After every 4th row DEC R3: not yet zero? go back --------->-----------------+
+                               ; Zero: R3 was loaded with either Rate or Delay. R5 has scancode to repeat:    |
+                               ; Put R5 into FIFO only when FIFO empty:                                       |
+022D: D5      SEL RB1          ;                                                                              |
+022E: 2A      XCH A,R2         ; A here is R5, scancode to repeat                                             |
+022F: F2 37   JB7 $0237        ; test bit7 of $1A: FIFO has data? -> leave it, just Load Typematic Rate       |
+                                                                                                              |
+0231: 2A      XCH A,R2         ; no, FIFO empty: restore A                                                    |
+0232: C5      SEL RB0                                                                                         |
+0233: 54 3D   CALL $023D       ; -> Put A into scancode buffer.. then Load Typematic Rate into R3 loop count  |
+0235: 44 22   JMP $0222        ; -> done -------------------------------->------------------------------------+
+0237: 2A      XCH A,R2         ; FIFO has data: write back $1A                                                |
+0238: C5      SEL RB0                                                                                         |
+0239: 54 3F   CALL $023F       ; -> just Load Typematic Rate to R3 loop count                                 |
+023B: 44 22   JMP $0222        ; -> done ----------------------------------------->---------------------------+
+
+
+***********************************
+** Put A into scancode FIFO and  **
+**   Load Typematic Rate         **
+***********************************
+
+  ; SUB 
+023D: 74 9B   CALL $039B       ; -> Put A into scancode buffer
+                               ; then fall through Load Typematic Rate from R4 into R3
+
+***********************************
+**   Load Typematic Rate         **
+***********************************
+
+  ; Loads a loop count for Scanning Loop into R3 = (N+8)*M from R4, the Stored Typematic byte. 
+  ; R4=2C by default (0010 1100) "The typematic rate appx. 10 characters per second."
+  ; 
+  ;          R3              M
+  ;      0000 1xxx    00   * 1
+  ;      0001 xxx0    01   * 2
+  ;      001x xx00    10   * 4 
+  ;      01xx x000    11   * 8
+  ;                             
+  ;                 Delay    Typematic Rate    
+  ;      R4:    7   6   5   4   3   2   1   0        
+  ;                 |   |   |   |   |   |   | 
+  ;                  ---     ---     -------
+  ;                           M         N
+  ; SUB
+   
+023F: FC      MOV A,R4         ; R4 Stored Typematic byte
+0240: 53 18   ANL A,#$18       ; 000x x000
+0242: E7      RL A
+0243: 47      SWAP A           ; 0000 00xx
+0244: A8      MOV R0,A         ; Load M-1 into R0
+0245: FC      MOV A,R4
+0246: 53 07   ANL A,#$07
+0248: 43 08   ORL A,#$08       ; add 8: A = 0000 1xxx
+024A: 18      INC R0           ; R0 = M 
+024B: 77      RR A             ; 
+024C: E7      RL A             ; rotate M times          
+024D: E8 4C   DJNZ R0,$024C    ;                    
+024F: AB      MOV R3,A         ; Load result into R3 (typematic counter)
+0250: 83      RET
+
+
+
+**************************************************
+**         SENSE ROW                            **
+** SA with variable threshold (see US4305135)   **
+**************************************************
+
+  ; The 8048 drives the SA to sample the state of all 8 columns (T1=0 means a depressed key). 
+  ; Result in A/R6 with opposite lsb (later Encode works opposite too): 
+  ;          
+  ;            7   6   5   4   3   2   1   0
+  ;          +---+---+---+---+---+---+---+---+    
+  ;          |   |   | 1 |   |   |   |   |   |  R6
+  ;          +---+---+---+---+---+---+---+---+    
+  ;              eg. col 2 active  
+
+0251: 97      CLR C
+0252: B8 08   MOV R0,#$08      ; R0 = loop count
+0254: BE 00   MOV R6,#$00      ; R6 = return value
+0256: FA      MOV A,R2         ; R2= Row/Col eg. 58
+0257: 07      DEC A            ; eg. 57
+0258: 53 F8   ANL A,#$F8       ; eg. 50 (row mask)
+025A: AF      MOV R7,A         ; save row mask in R7
+
+025B: CA      DEC R2           ; -- eg. 57, 56, .. 50 ---------------------------------+
+025C: 99 FC   ANL P1,#$FC      ; clear SA RESET LATCH and Q                            |
+025E: FA      MOV A,R2         ; eg. 57, 56, .. 50                                     |
+025F: 02      OUTL BUS,A       ; DRIVE pulse on, write drive select and sense select   |
+0260: 89 02   ORL P1,#$02      ; now pull Q high (SA latches mux address)              |
+0262: 67      RRC A                                                                    |
+0263: E3      MOVP3 A,@A       ; load threshold from TABLE: /2, high nibble for odd    |     
+0264: F6 67   JC $0267                                                                 |
+0266: 47      SWAP A           ; Carry not set: swap A                                 |
+0267: 53 07   ANL A,#$07       ; keep 3 bits lsb                                       |
+0269: 4F      ORL A,R7         ; or with R7 drive select                               |
+026A: 02      OUTL BUS,A       ; write bus                                             |
+026B: 97      CLR C                                                                    |
+026C: 00      NOP                                                                      |
+026D: 00      NOP                                                                      |
+026E: 00      NOP                                                                      |
+026F: 89 01   ORL P1,#$01      ; set RESET high (SA latches threshold and enabled)     |
+0271: 88 80   ORL BUS,#$80     ; disable drive: discharge                              |
+0273: 56 76   JT1 $0276        ; sample output Q                                       |
+0275: 1E      INC R6           ; pulled low? (SA closed, depressed): rotate 1 into msb |
+0276: FE      MOV A,R6         ; high: keep msb zero                                   |
+0277: 77      RR A                                                                     |
+0278: AE      MOV R6,A         ; rotate into R6                                        |
+0279: E8 5B   DJNZ R0,$025B    ; --- 8 times ------------------------------------------+
+027B: 83      RET              ; we leave with eg. R2=50
+
+
+
+******************************
+**   Diff Word -> R6        **
+******************************
+
+  ; JNZ after 1st scanning, A<>0 (one or more keys down)
+  
+027C: D1      XRL A,@R1        ; same as prev?
+027D: C6 9B   JZ $029B         ; -> yes, no change in row status between scans: key(s) still held down
+                               ;    (we could just jump back to scanning loop but instead..)
+                               ; -> not the same: fall through to Triple Sense with two different non-zero states 
+                               
+
+******************************
+**   Triple Sense Routine   **
+******************************
+
+  ; We get here when there is a difference between the 1st reading (A) and the stored previous state of the row (@R1): 
+  ;   - either with A=0 (no keys down), but prev @R1 was non-zero: key(s) has been released
+  ;   - or A<>0 but prev @R1 was zero: key(s) has been depressed
+  ;   - also when both state non-zero but different: a second key on the same row has been depressed/released
+  ;
+  ; Reads sensors two more times and accepts only those status bits of the 3rd reading that were stable along all 3 readings. 
+  ; Any other differences are masked out from the Diff Word. 
+  ; 
+  ; Result in R6 (Diff Word) to process by Diff Word to scancodes.
+  ; 
+  ; $2D/$2E used for intermediates:
+  ; 
+  ;   1.  store 1st reading in $2D
+  ;   3.  store 2nd reading in $2E
+  ;   4.  xor these two 
+  ;   5.  store result in $2D (zero when same)    $2D = 1st XOR 2nd
+  ;   6.  3rd reading 
+  ;   7.  xor with $2E (zero when same again)     $2E = 3rd XOR 2nd
+  ;   8.  now OR these two (zero if all same)
+  ;   9.  and CPL: this is FF when all 3 readings are the same (MASK)
+  ; 
+  ;   Now do a 'normal' XOR from 3rd reading for the Diff Word BUT USE THE MASK: 
+  ;   
+  ;   
+  ;   1st           2nd            3rd              @R1
+  ;    |            | |            | |              | |
+  ;     ---- xor ---   ---- xor ---  |              | |
+  ;           |              |       |      2.      | |
+  ;            ---- or ------        |              | |
+  ;                  |                ---- xor -----  |
+  ;                 cpl                     |         |
+  ;                  |          1.          |         |
+  ;                   --------------------[and]       |
+  ;                                         |         |
+  ;                                         R6        |
+  ;                                         |     3.  |
+  ;                                          -- xor --
+  ;                                              |
+  ;                                             @R1 (update)
+
+>> JNZ
+027F: D1      XRL A,@R1        ;  restore 1st reading into A 
+0280: B8 2D   MOV R0,#$2D
+0282: A5      CLR F1
+
+0283: A0      MOV @R0,A        ; move A to @R0 (first $2D, then $2E) 
+0284: FA      MOV A,R2         ; 
+0285: 03 08   ADD A,#$08       ; add 8 to R2 to read same row again
+0287: AA      MOV R2,A         ; 
+0288: 54 51   CALL $0251       ; -> scan row 
+
+028A: B8 2E   MOV R0,#$2E
+028C: 76 94   JF1 $0294        ; second? -> break
+028E: B5      CPL F1           ; set second
+028F: A0      MOV @R0,A        ; move second reading to $2E
+0290: C8      DEC R0           ; ptr back to 2D
+0291: D0      XRL A,@R0        ; compare these to readings (zero if same, ok)
+0292: 44 83   JMP $0283        ; write to $2D, then 
+
+0294: D0      XRL A,@R0        ; R0=2E and F1 was set: xor A with $2E 
+0295: C8      DEC R0
+0296: 40      ORL A,@R0        ; = bits different in the 3 reading
+0297: 37      CPL A            ; computes a mask to AND -last (3rd) reading XOR prev stored- with
+
+0298: 2E      XCH A,R6         ; R6: last (3rd) reading
+0299: D1      XRL A,@R1        ; xor last (3rd) reading with prev stored
+029A: 5E      ANL A,R6         ; and mask it with the CPL (that should be FF).. then put into R6 
+
+  ; strangely, we branch here also when held key(s) are the same in row..
+  ; but then Diff Word R6=0 and Encode will no find any changed bit(s).. just goes back to Scanning Loop (why?)
+              
+029B: AE      MOV R6,A         ; R6= Diff Word
+029C: D1      XRL A,@R1        ; restore A to 3rd
+029D: A1      MOV @R1,A        ; save as new state 
+029E: BF 08   MOV R7,#$08      ; load R7 with 08 (for the sub that follows)
+02A0: FA      MOV A,R2
+02A1: 6F      ADD A,R7         ; add 8 to R2 (restore R2, eg. 58 again)
+02A2: AA      MOV R2,A
+02A3: 64 40   JMP $0340        ; --> Diff Word to scancodes: checks each bit changed, puts scancode(s) into FIFO -> then back to Scanning Loop
+
+
+************************************
+**   SUB Shift Left FIFO Buffer   **
+************************************
+
+  ; After transmit $1C ok.. shifts left whole buffer
+  ; Called only when FIFO not empty: R0 = 1D...2D, it will shift the overrun byte too
+
+02A5: D5      SEL RB1
+02A6: F8      MOV A,R0         ; load buffer pointer
+02A7: 07      DEC A            ; 
+02A8: AB      MOV R3,A         ; R3 = last to move below= ptr-1
+02A9: A8      MOV R0,A         ; dec $18 FIFO POINTER 
+02AA: D3 1C   XRL A,#$1C       ; 1C? 
+02AC: 96 B3   JNZ $02B3        ; -> no, more than one in FIFO
+02AE: 2A      XCH A,R2         ; yes, only one in FIFO: A=1C
+02AF: 53 7F   ANL A,#$7F
+02B1: 2A      XCH A,R2         ; clear bit7 of $1A: buffer empty again and return
+02B2: 93      RETR
+
+02B3: B9 1D   MOV R1,#$1D      ; more than one in FIFO: A<>1C, R1=1D 
+02B5: F1      MOV A,@R1        ;                 -------------------+
+02B6: C9      DEC R1           ;                                    |
+02B7: A1      MOV @R1,A        ;  move @R1 to @R1-1                                  |
+02B8: 19      INC R1           ;                                    |
+02B9: FB      MOV A,R3                                              |
+02BA: D9      XRL A,R1                                              |
+02BB: C6 B2   JZ $02B2         ; last byte R3 reached? ->RETR       |
+02BD: F9      MOV A,R1         ; there is more                      |
+02BE: D3 2C   XRL A,#$2C                                            |
+02C0: C6 B2   JZ $02B2         ; last in buffer? $19=2C? yes, return|
+02C2: 19      INC R1           ; no: move next                      |
+02C3: 44 B5   JMP $02B5        ; loop ------------------------------+
+
+
+*********************************************
+**  ED command: Set/Reset Mode Indicators  **
+*********************************************
+
+02C5: FA      MOV A,R2
+02C6: 53 84   ANL A,#$84
+02C8: 43 C2   ORL A,#$C2
+02CA: AA      MOV R2,A         ; R2 = R2 & 84 | C2 (1100 0x10)
+02CB: 04 0D   JMP $000D        ; -> back and wait for next byte 
+
+>> Set/Reset leds parameter received in A:
+
+02CD: 12 D3   JB0 $02D3
+02CF: 9A FE   ANL P2,#$FE      ; Scroll led ON
+02D1: 44 D5   JMP $02D5
+02D3: 8A 01   ORL P2,#$01      ; Scroll led OFF
+02D5: 32 DB   JB1 $02DB
+02D7: 9A FD   ANL P2,#$FD      ; Num led ON
+02D9: 44 DD   JMP $02DD
+02DB: 8A 02   ORL P2,#$02      ; Num led OFF
+02DD: 52 E3   JB2 $02E3
+02DF: 9A FB   ANL P2,#$FB      ; Caps led ON
+02E1: 44 E5   JMP $02E5
+02E3: 8A 04   ORL P2,#$04      ; Caps led OFF
+02E5: FA      MOV A,R2
+02E6: 53 FD   ANL A,#$FD
+02E8: AA      MOV R2,A         ; done: clear bit1 of R2 (xxxx xx0x): parameter processed
+02E9: 04 35   JMP $0035        ; back to response    
+
+
+02EB: 00 00 00 00 00 00 00 00 | 00 00 00 00 00 00 00 00 
+      00 00 00 00 00
+
+
+********************************************************
+**    THRESHOLD TABLE for the SENSE AMPLIFIER IC      **
+**      3-bit values in two nibbles                   **
+**      odd column in high nibble (SWAP)              **
+********************************************************
+
+0300: 11 11 21 77 11 11 41 77 | 11 71 21 77 71 12 21 77 | ..!w..Aw.q!wq.!w
+0310: 12 11 22 77 22 11 41 77 | 14 32 21 77 72 22 13 77 | .."w".Aw.2!wr".w
+0320: 12 23 13 77 14 34 21 77 | 07 17 22 77 22 12 72 77 | .#.w.4!w.."w".rw
+0330: 77 77 77 17 71 71 17 77 | 21 21 12 13 71 21 13 13 | www.qq.w!!..q!..
+
+
+*************************************
+**    JMP Diff Word to scancodes   **
+*************************************
+
+  ; It checks every changed bits and puts make/breakcodes into FIFO after Row/Col translation. 
+  ; Checks and skips SAT (R2=50). Deals also with the Typematic key in R5 and loads R3 typematic counter. 
+  ; Then back to scan the next row. 
+  ; 
+  ; Example:
+  ; 
+  ;   0  0  1  0  0  0  0  1    <-  R6 Diff Word: these bits has changed (= present-state XOR previous-state)
+  ;   0  1  0  0  0  1  0  1    <-  @R1 Matrix Map pointer to updated state 
+  ;         |              |
+  ;      release         push
+  ; 
+  ; R1: Matrix Map @R1 present-state
+  ; R2: Row (eg. 58) then decrement
+  ; R3: Typematic Counter 
+  ; R5: Typematic (held) key
+  ; R6: Diff Word  
+  ; R7: loaded by caller=8 loop count
+
+0340: CA      DEC R2           ; ---- R2= eg. 57,56,.. ------------------+
+0341: FE      MOV A,R6                                                   |
+0342: 12 4E   JB0 $034E        ; R6_0 set? Changed sensor in col? ->     |
+0344: FE      MOV A,R6         ; R6_0 not set:                           |
+0345: 77      RR A                                                       |
+0346: AE      MOV R6,A         ; rotate R6                               |
+0347: F1      MOV A,@R1                                                  |
+0348: 77      RR A                                                       |
+0349: A1      MOV @R1,A        ; rotate @R1                              |
+034A: EF 40   DJNZ R7,$0340    ; --- loop 8 times -----------------------+
+
+034C: 44 17   JMP $0217        ; -> R7 expired (eg. R2=50): we've checked every bit -> back to SCANNING LOOP
+
+034E: F1      MOV A,@R1        ; Changed sensor in row (R6_0=1)
+034F: 12 67   JB0 $0367        ; @R1_0=1? -> 
+
+0351: FA      MOV A,R2         ; Case R6=1 @R1=0 (prev pushed, now released)
+0352: D3 50   XRL A,#$50       ; SAT is not supposed to change and be released!
+0354: C6 89   JZ $0389         ; R2=50? -> clear R2 and Transmit FD to Host (Diagnostic Failure) -> then back to 000D Main Loop
+
+0356: 74 8F   CALL $038F       ; R2 not 50: --> Translate  
+0358: DD      XRL A,R5         ; check new breakcode against the stored repeat in R5 (when R2 zero, bit7 sets)
+0359: 53 7F   ANL A,#$7F
+035B: 96 61   JNZ $0361        ;   not the same: keep R5 for repeating again
+035D: FD      MOV A,R5         ;   same: last pushed key has been released
+035E: 53 80   ANL A,#$80       
+0360: AD      MOV R5,A         ;   R5 = x000 0000 (stop repeat)
+0361: 74 8F   CALL $038F       ; --> Translate
+0363: 43 80   ORL A,#$80       ; set bit7 and
+0365: 64 77   JMP $0377        ; -> Put A into scancode buffer (a breakcode)
+
+0367: FA      MOV A,R2         ; Case R6=1 @R1=1 (prev released, now pushed)
+0368: D3 50   XRL A,#$50       ; R2=50? -> OK, SA still sane, this should be always '1' (guess this happens only once after this MAP location init to zero)
+036A: C6 44   JZ $0344         ; -> back to loop for next bit
+
+036C: 74 7B   CALL $037B       ; R6=1 @R1=1 not 50: -> load Typematic Delay into R3 -> back to repeat-loop with delay
+036E: 74 8F   CALL $038F       ; R2 not 50: --> Translate (to compare with R5) 
+0370: 2D      XCH A,R5         ; 
+0371: 53 80   ANL A,#$80       ; Set R5 to this last makecode: clear R5, keep bit7 = x000 0000 (isn't bit7 always 0??)
+0373: 4D      ORL A,R5         ; or with A <- put new makecode into R5= x010 1100 (ex) CAN BE BIT7 SET HERE??
+0374: AD      MOV R5,A         ; write R5
+0375: 74 8F   CALL $038F       ; --> Translate 
+0377: 74 9B   CALL $039B       ; -> Put A into scancode buffer
+
+0379: 64 44   JMP $0344        ; -> back to loop for next bit
+
+
+
+**********************************
+**   SUB Load Typematic Delay   **
+**********************************
+
+  ; From bit5_6 of the stored Typematic Rate/Delay in R4 loads a loop count into R3 used in Scanning Loop 
+  ; R3 will be 3C, 78, B4 or F0 (n*3C) 
+
+037B: FC      MOV A,R4         ; from R4:
+037C: 53 60   ANL A,#$60       ; bits5_6
+037E: 77      RR A
+037F: 47      SWAP A           ; 0000 00xx
+0380: 17      INC A
+0381: A8      MOV R0,A         ; R0= 1,2,3,4
+0382: 27      CLR A
+0383: 03 3C   ADD A,#$3C
+0385: E8 83   DJNZ R0,$0383
+0387: AB      MOV R3,A
+0388: 83      RET
+ 
+
+  ; JZ: SA did not sense R2=50: Failure 
+0389: 23 FD   MOV A,#$FD
+038B: BA 00   MOV R2,#$00      ; Clear R2: we'll start scanning again
+038D: 24 40   JMP $0140        ; --> jump into Command and Send FD to Host: SA Failure
+
+
+***********************************************
+**   SUB Translate Row/Col to FIFO scancode  **
+***********************************************
+    
+038F: FA      MOV A,R2
+0390: 97      CLR C
+0391: 03 B0   ADD A,#$B0
+0393: C6 9A   JZ $039A         ; R2=50? return  00 (should not occur)
+0395: F6 98   JC $0398         ; R2>50? return  R2
+0397: 17      INC A            ; R2<50: return  R2+1
+0398: 03 50   ADD A,#$50
+039A: 83      RET
+
+
+***********************************************
+**   SUB Put 'A' into scancode buffer FIFO   **
+***********************************************
+
+039B: D5      SEL RB1          ; Register Bank-1
+039C: 2A      XCH A,R2
+039D: F2 A3   JB7 $03A3        ; test bit7 of $1A: FIFO has data? -> 
+039F: B8 1C   MOV R0,#$1C      ;   FIFO empty: set pointer to first $18= 1C
+03A1: 43 80   ORL A,#$80       ;   and set bit7 of $1A: FIFO has data
+03A3: 2A      XCH A,R2         ; write $1A
+03A4: AB      MOV R3,A         ; save A
+03A5: F8      MOV A,R0         ; check FIFO pointer for 2D:
+03A6: D3 2D   XRL A,#$2D       ; 
+03A8: C6 B2   JZ $03B2         ; full? already overrun? sorry, keystroke lost -> return
+
+03AA: 07      DEC A            ; not 2D: check for 2C (only 2C xor 2D = 1 ):  
+03AB: 96 AF   JNZ $03AF        ; not 2C; ok, there is more space -> 
+03AD: BB 80   MOV R3,#$80      ; =2C: write overrun byte (80) as the last byte in FIFO at $2C
+
+03AF: FB      MOV A,R3         ; restore A
+03B0: A0      MOV @R0,A        ; move A to @R0: 1C...2C
+03B1: 18      INC R0           ; inc FIFO POINTER 
+03B2: 93      RETR             ; RETR restores to Bank-0
+
+  The FIFO  
+  ========
+  
+          bit7    
+          buffer                                    16 + 1 byte buffer
+         has data
+            |     
+     tmp    |  tmp   |--------------------------------------------------------------------------------|
+  0   R1   R2   R3           
+  8   19   1A   1B   1C   1D   1E   1F   20   21   22   23   24   25   26   27   28   29   2A   2B   2C
+  |                             ^                                                                   overrun
+  |                             |                                   FIFO full condition:        
+  +-----------------------------+                                     - $2C = 80h overrun byte                      
+        FIFO POINTER                                                  - R0' = 2Dh (FIFO pointer)    
+     points to next empty slot  
+                                              
+ 
+****************************************
+**   JMP Clear scancode FIFO buffer   **
+****************************************
+
+  ; $18 R0' FIFO POINTER = 1C 
+  ; $1A R2' cleared 
+
+03B3: D5      SEL RB1          ; Register Bank-1
+03B4: BB 11   MOV R3,#$11      ; 17 bytes to clear
+03B6: B8 1C   MOV R0,#$1C      ; start address
+03B8: 27      CLR A
+
+03B9: A0      MOV @R0,A        ; clear $1C ... $2C
+03BA: 18      INC R0
+03BB: EB B9   DJNZ R3,$03B9
+
+03BD: 2A      XCH A,R2
+03BE: 53 7F   ANL A,#$7F
+03C0: 2A      XCH A,R2         ; clear bit7 of $1A
+03C1: B8 1C   MOV R0,#$1C      ; fifo pointer: $18 = 1C 
+03C3: 93      RETR             ; RETR restores to Bank-0
+
+
+03C4:             31 35 30 33 | 30 39 39 20 43 4f 50 52 |     1503099 COPR
+03D0: 2e 20 49 42 4d 20 31 39 | 38 33 00 00 00 00 00 00 | . IBM 1983......
+03E0: 00 00 00 00 00 00 00 00 | 00 00 00 00 00 00 00 00 | ................
+03F0: 00 00 00 00 00 00 00 00 | 00 00 00 00 00 00 00 00 | ................
+
+
+>> END OF ROM

@@ -1,0 +1,1992 @@
+                 8042 PS/2 INTERN 
+                 ==================
+
+         Commented disassembly of the PS/2 
+        keyboard/auxiliary device controller
+                   8042 2KB ROM
+
+                 A. Tarpai 2018
+  (Questions & comments are welcome to tarpai76 at gmail)
+          This file has been downloaded from
+     http://www.halicery.com/8042/8042_PS2_INTERN.TEXT
+
+ 
+The file "72x8455.zm82" is from the MESS project and dates 1987. Another wonderful vintage piece of 8-bit assembly. The motivation for analyzing this piece of code was to finally check how simultaneous keyboard/mouse movements are handled by the 8042 controller, what happens when both devices are bombarding the 8042, what is the order of servicing both devices and the host PC. 
+
+
+Intro
+=====
+
+When the IBM PS/2 came out in 1987 it had two, similar 6-pin mini-DIN connectors. One for the 101/102-Key keyboard device (KBD) and one for the auxiliary device, AUX (mouse, touchpad, trackball): 
+
+	     1984                                        1987
+	  ____ ____                            ___ ___           ___ ___   
+	 /    -    \                          /   -   \         /   -   \  
+	|           |                        |  6   5  |       |  6   5  | 
+	| 1       3 |                        | 4     3 |       | 4     3 | 
+	|  4     5  |                         \  2 1  /         \  2 1  /  
+	 \    2    /                            -----             -----    
+	   -------                                                         
+	     AT                                 PS/2              PS/2     
+	  5-pin DIN                        6-pin Mini-DIN    6-pin Mini-DIN
+	  KEYBOARD                            KEYBOARD          AUXILIARY
+                                       
+On the motherboard IBM used the same 8042 microcomputer UPI as in the AT for interfacing with the KBD and AUX. Most of the programming and electrical features are the same as of the AT (I/O ports 0x60/0x64, bi-directional serial communication using the "AT PROTOCOL"), but the 8042 in the PS/2 is extended to control a second device. Even in the ROM the copyright string shows two dates: 1983 (release for the AT) and 1987 (release for the PS/2). 
+
+	+----------------+
+	|                |
+	|   IBM PS/2     | 
+	|   ("Host")     |                 AT PROTOCOL 
+	|            +----+                           
+	|       0x60 |    |  <--- CLOCK ------------------>  KEYBOARD
+	|       0x64 |    |  <--- DATA ------------------->  DEVICE
+	|            |8042|
+	|            |    |  <--- CLOCK ------------------>  AUXILIARY 
+	|            |    |  <--- DATA ------------------->  DEVICE
+	|            +----+
+	|                |      
+	|                |       
+	|                |       
+	+----------------+       
+
+
+The Host interface
+==================
+
+The disassembly was commented from the 8042's point of view: Host is the IBM PC. Host writes the 8042's input buffer, IB (through 0x60/0x64) and the 8042 writes to its output buffer, OB, which the Host reads through 0x60. Host can read the STATUS REGISTER (STS) any time through 0x64: 
+ 
+	        |      R       |    W
+	--------+--------------+-----------------
+	 0x60   |   read OB:   | write IB:       
+	(A0=0)  |    OBF=0     | F1=0 and IBF=1  
+	        |              |                 
+	 0x64   |   read STS   | write IB:       
+	(A0=1)  |              | F1=1 and IBF=1  
+	        |              |                 
+
+The 8042 has only one *address* pin, A0. When the Host CPU reads/writes the 8042, the state of A0 is copied into the F1 flag of STS. F1 can be tested with instructions. 
+
+	    7       6       5       4       3       2       1       0                              
+	+-------+-------+-------+-------+-------+-------+-------+-------+
+	|   8042   u s e r   b i t s    |   F1  |   F0  |  IBF  |  OBF  |  STATUS REGISTER (STS)
+	+-------+-------+-------+-------+-------+-------+-------+-------+                         
+
+
+Schematics
+==========
+
+This ROM handles the 2 devices and in a quite similar manner both electronically and programmatically. For example reading data from KBD/AUX are implemented in two subroutines that are almost identical: they just control different input/output pins. Those are not commented fully for simplicity. The firmware was written according to this schematics:  
+ 
+	                                                                           +5V             +5V   
+	                +-------------------+                                       |               |    
+	          ----> |R               P10| <--   KBD DATA                        |               |    
+	          ----> |W      8042     P11| <--   AUX DATA                        |               |    
+	          ----> |A0     ====     P12|  --                                   |               |    
+	                |                P13|  --                                   |               |    
+	                |                P14|  --                                   |               |    
+	                |                P15|  --                                   |               |    
+	                |                P16|  --                                   |               |    
+	                |       C P U    P17|  --                                   |               |    
+	Host            |       R O M       |                                       |               |    
+	system          |D7     R A M    P20| -->   HOT RES*                    +5V |           +5V |    
+	R/W             |D6              P21| -->   PASS A20                     |  |            |  |    
+	                |D5              P22| -->   AUX DATA*                    |  |            |  |    
+	         <----> |D4              P23| -->   AUX CLK*                     |  |            |  |    
+	                |D3              P24| -->   IRQ1                         |  |            |  |    only the KBD CLK
+	                |D2              P25| -->   IRQ12                        |  |            |  |    "loop" drawn
+	                |D1              P26| -->   KBD CLK*    -- INV ---->-----+  |            |  |    (same for all 4)
+	                |D0              P27| -->   KBD DATA*                    |  |            |  |    
+	                |                   |                                    |  |            |  |    
+	                |              TEST0| <--   KBD CLK     ---<-------------+  |            |  |    
+	                |              TEST1| <--   AUX CLK                      |  |            |  |    
+	                +-------------------+                                    |  |            |  |
+	                                                                         |  |            |  |    
+	                                                                         |  O            |  O    
+	                                                                         O DATA          O DATA
+	                                                                        CLK             CLK 
+	                                                                        
+	                                                                        Mini-DIN        Mini-DIN
+	                                                                          KBD             AUX
+
+
+8042 I/O PORTS
+==============
+
+Port-1 and the two Test pins are used for input, Port-2 is output. CLK and DATA outputs are driven through an inverter: that is writing '1' to a P2 pin will pull the line active low. 
+
+	     7         6         5         4         3         2         1         0
+	+---------+---------+---------+---------+---------+---------+---------+---------+
+	|  KBD    |  KBD    |  IRQ12  |  IRQ1   |  AUX    |  AUX    |  A20    |  RES    |    P2
+	|  DATA   |  CLK    |         |         |  CLK    |  DATA   |         |         |
+	+---------+---------+---------+---------+---------+---------+---------+---------+
+	    |          |                             |         |         |        |
+	   INV        INV                           INV       INV        |       INV
+	    |          |                             |         |         |        |
+	    O---       O---                          O---      O---               
+	    |          |                             |         |                  
+	   P10        T0                            T1        P11
+
+AT KEYBOARD- or PS/2 SERIAL PROTOCOL: CLK and DATA lines are passively pulled up to +5V on the motherboard, the basis of the bi-directional protocol: both 8042 and device can control the line by actively pull it low. They can read the state of the line at any time. The protocol is asymmetric between 8042 and device: 8042 can inhibit communication at any time by pulling CLK low. During data transfer CLK is always generated by the device for both transfer directions. 
+
+	                          +5V                 passive '1' (released, High-Z) - reads as '1'
+	                           |                /
+	   o------------o----------+--------- line   
+	   |            |                           \ 
+	device        8042                            active '0' (pulled low) - reads as '0'
+	   |            |
+	  GND          GND
+
+
+
+Normal Mode of Operation 
+========================
+
+The 8042 spins in the Main Loop, which polls 3 events: 
+
+1. Host written into IB and IBF set 
+2. KBD has pulled CLK low
+3. AUX has pulled CLK low
+
+Whichever happens first handled, while disabling the other device(s). There is no simultanous execution, everything is serialized. Based on the KBD/AUX DIS bits in RAM $20, different loops are entered. In these diagrams a false condition always flows further "down", while a yes to an answer goes somewhere horizontal:
+
+
+	     Both disabled Loop                                                                                                  
+	    or Host hasn't read yet    KBD only Loop             AUX only Loop             Both KBD/AUX Loop      
+	             ||                     ||                        ||                          ||
+	             ||                     ||                        ||                          ||  
+	             \/                     \/                        \/                          \/
+	                
+	                
+	        0388: MAIN LOOP
+	              |
+	              |
+	              |               +--------<------------------------------------------------------------------+
+	              |               |                                                                           |
+	    +----> IB full? ----> command? --------> 0502: process command-----+---- - -                          |
+	    |         |               |                                       D4                                  |
+	    |         |          0202: Send to KBD                             |                                  |
+	    +--<-- OB full?                                               027E: Send to AUX                       |
+	    |         |                                                                                           |
+	    |         |                                                                                           |
+	    |         |                                                                                           |
+	+---|-----> AUX en? -------------------------------->  release AUX CLK                                    |
+	|   |         |                                               |                                           |
+	|   |       KBD en? -----> release KBD CLK                  KBD en? -------------> release KBD CLK        |
+	|   |         |                   |                           |                           |               |
+	|   +--<------+         +--> KBD CLK low? -->[1]    +--> AUX CLK low? -->[2]    +--> KBD CLK low? -->[1]  |
+	|                       |         |                 |         |                 |         |               |
+	|                       +--<-- IB empty?            +--<-- IB empty?            |    AUX CLK low? -->[2]  |
+	|                                 |                           |                 |         |               |
+	|                                 |                           |                 +--<-- IB empty?          |
+	|                                 |                           |                           |               |
+	|                                 +------------->-------------+------->--------- pull both clocks low     |
+	|                                                                                         |               |
+	|                                                                                         +-------->------+
+	|             [1]                                                      [2]
+	|              |                                                        |
+	|       KBD CLK pulled low                                       AUX CLK pulled low   
+	|              |                                                        |             
+	|          KBD CLK high? -----> $24 --->---+----<--- $32  <--------- AUX CLK high?         
+	|              |                           |                            |             
+	|          inh AUX CLK                     |                        inh KBD CLK       
+	|              |                           |                            |             
+	|     0602: Receive from KBD               |                   0670: Receive from AUX  
+	|                                          |
+	|                                 pull both clocks low               
+	|                                          |                 
+	|                               inc $24/$32 "noise" counter
+	|                                          |                 
+	+-------------------------------<----------+
+
+
+ROM MAP OF 8 PAGES
+==================
+
+PAGE-0: RESET
+
+PAGE-1: PASSWORD SECURITY  
+
+PAGE-2: TO DEVICE
+
+        0202: Send to KBD and receive response
+        022C: Transmit to KBD
+        027E: Send to AUX and receive response
+        02A8: Transmit to AUX
+
+PAGE-3: XLAT TABLE, MAIN LOOP
+
+        0300: XLAT TABLE
+        0388: MAIN LOOP
+        03E0: Host command
+        
+PAGE-4: FROM DEVICE
+
+        0402: Receive response from KBD
+        0430: Receive transmission from KBD
+        0457: Receive response from AUX
+        0485: Receive transmission from AUX
+        
+PAGE-5: HOST COMMAND PROCESSING
+        
+PAGE-6: FROM DEVICE
+        
+        0602: Receive from KBD (and XLAT)
+        0670: Receive from AUX
+        
+PAGE-6: TO HOST
+        
+        0700: Send R4 to Host from KBD
+        071A: Send R4 to Host from AUX
+        0734: Test PS/2 port KBD
+        0767: Test PS/2 port KBD
+        079A: BAT
+
+
+Security Mode Operation 
+=======================
+
+There is another Main Loop when the 8042 is 'locked' by a loaded password. It continues to poll both devices but ignores Host input: 
+
+   016F: SECURITY MAIN LOOP
+             |
+             |
+             |
+        release KBD/AUX 
+         CLK and DATA
+             |
+     +-> KBD CLK pulled low? --> 0602: Receive from KBD
+     |       |
+     |   AUX CLK pulled low? --> 0670: Receive from AUX 
+     |       |
+     +--<----+
+
+AUX is served as usual, except no data sent to the Host. KBD input is monitored and matched against the stored password in RAM using the XLAT TABLE. On startup security is disabled. Host can install the security string by a command: the string is written into RAM from location $50 with zero trailing. Security mode can be then turned on and off by other commands. When on, 8042 enters the Security Main loop and polls only device CLK-s. Every scancode from the KBD is translated to Set-1 and checked against the stored string; a full match turns security mode off, and 8042 enters the normal Main Loop again. 
+
+
+STATUS REGISTER (STS) user bits
+===============================
+
+The firmware sets/clears bits in the user-part of the Status Register for status and error conditions. Host can read this register any time through 0x64:  
+
+	     7         6         5         4         3         2         1         0
+	+---------+---------+---------+---------+---------+---------+---------+---------+
+	| parity  | time-out|  aux    |  full   |   F1    |   F0    |   IBF   |   OBF   |    STATUS REGISTER (STS)
+	|  even   |         |  full   |         | CMD/DAT |         |         |         |
+	+---------+---------+---------+---------+---------+---------+---------+---------+
+	
+	 <-------------------------------------> <------------------------------------->
+	      user bits: set by MOV STS,A                     8042 CPU bits
+
+In Page-7 when sending to Host, i.e. before the OUT DBB,A intruction, the high nibble is written as:  
+- full, aux full: from KBD set to 10h, from AUX set to 30h
+- status in R1 passed by caller: 00, 40, 80, C0 (TODO exactly when and what)
+
+   
+128 bytes RAM map
+=================
+
+256 bytes: 8042AH/8742AH 
+128 bytes: 8041AH/8741AH
+64 bytes:  8741A
+
+This ROM code uses 128 bytes of RAM. Location $20 is used as a register to control the operation of the 8042 firmware:
+
+	     7         6         5         4         3         2         1         0
+	+---------+---------+---------+---------+---------+---------+---------+---------+
+	|         | XLAT    | AUX     | KBD     |         | =  F0   | AUX     |KBD      |    $20
+	|         | ON      | DIS     | DIS     |         |         | IRQ EN  |IRQ EN   |
+	+---------+---------+---------+---------+---------+---------+---------+---------+
+
+XLAT ON: translate AT-scancode. Backward compatibility with XT-keyboard sending 1-byte scancodes to Host.
+AUX/KBD DIS: ignore (do not poll) the device's CLK line. 
+F0: Command write to RAM[20h] sets/clears CPU-flag F0, i.e. F0 is mirrored through $20. 
+AUX/KBD IRQ EN: when cleared, do not assert the hardware IRQ line connected to P2. 
+
+The Reset routine clears the RAM content and sets up a few default values:
+
+RAM   INIT 
+
+$20 = 00h  <- controls bits 
+$21 = 01h  <- Resend-count. After reading device with parity error: send FEh = Resend Command to device that many times. Also count this erroneous event in $23/$31 for KBD/AUX. 
+
+$22 = 0Bh  <- Receive Wait Loop Count KBD. When waiting for response from KBD after sending data (Host written 0x60). 
+              Writing 0 here will cause 8042 to ignore dealing with the response byte after sending. When?? Non-standard keyboard or device?
+$23 = 00h  <- KBD resend (command FEh) counter until FFh when reading from KBD with parity error
+$24 = 00h  <- counter for too short (unstable, noise) KBD CLK pull down in Main Loop (counts until FFh)
+
+$25 = 02h  <- ??? not referenced only init
+
+$26 = 00h  <- RTS state time-out value when sending to device (set to max)
+$27 = F8h  <- DATA BIT time-out value (loaded, then start timer increments this value: on overflow an interrupt occurs)
+$28 = CEh  <- START BIT time-out value for serial transmission protocol (see PAGE 4) loaded in Main Loop
+
+$29 = 0Bh  <- ??? not referenced only init
+$2A = 10h  <- ??? not referenced only init
+$2B = 20h  <- RAM-base for R/W RAM Commands
+$2C = 15h  <- ??? not referenced only init
+$2D = 00h  <- when XLAT on: bit7 is the stored break code bit (set to 80h after KBD sent F0h, cleared to zero after the next scancode) 
+$2E
+$2F = 00h  <- counter for IBF INTERRUPT occurred error (counts until FFh)
+
+$30 = 0Bh  <- Receive Wait Loop Count AUX. When waiting for response from AUX after sending data (same as KBD)  
+$31 = 00h  <- AUX resend command (FEh) counter until FFh after parity-error
+$32 = 00h  <- counter for too short (unstable, noise) AUX CLK pull down in Main Loop (counts until FFh)
+
+$33        <- Security ON notification (init to zero but never written by 8042). If non-zero, send this byte to Host and assert IRQ1 after the end of Command A6: Enable Security  
+$34        <- Security OFF notification. If non-zero (init to zero but never written by 8042), send this byte to Host and assert IRQ1 after PASSWORD MATCH and clearing the PASSWORD SECURITY BIT ($40)
+$35        <- referenced only in an orphan code fragment (?) 
+$36        <- ignore keystroke 1. keystroke check against this too in security mode
+$37        <- ignore keystroke 2. keystroke check against this too in security mode
+$3E        <- a location for RAM read/write address only when RAM-BASE ($2B) is set higher than the default 20h, and attempting to access the upper 64-bytes of RAM
+
+$40 =      <- SECURITY MODE. 00: OFF, 01: ON 
+$41
+$42        <- a pointer used to walk security characters starting from $50 during password match
+$50..$7F   <- Password written here. Test $50 for zero: Password Installed
+    
+
+DISASSEMBLY
+===========
+
+Opening 72x8455.zm82
+
+>>>>>>>> HARD RESET
+0000: 04 4B   JMP $004B        ; ---> go Reset 
+0002: 00      NOP              ; orphan, never executed
+
+>>>>>>>> CPU IBF INTERRUPT
+0003: 04 40   JMP $0040        ; ---> go IBF interrupt
+
+>>>>>>>> SUB ROM chksum 
+0005: A3      MOVP A,@A        ; read page-0
+0006: 83      RET
+
+>>>>>>>> CPU TIMER INTERRUPT
+0007: 04 30   JMP $0030        ; ---> go TIMER interrupt 
+
+0009: 37 32 58 38 34 .. .. ..  ; "72X8455 Copyright IBM Corp. 1983, 1987 "
+
+>>>>>>>> TIMER interrupt
+0030: 65      STOP TCNT        ; NOT GOOD WHEN THIS HAPPENS: time-out error
+0031: C7      MOV A,PSW        ; Fakes a return from any "timed" subroutine
+0032: 53 07   ANL A,#$07       ; by popping the stack and                 
+0034: 07      DEC A            ; returning 02 in A                      
+0035: A8      MOV R0,A          
+0036: C7      MOV A,PSW         
+0037: 53 F8   ANL A,#$F8        
+0039: 48      ORL A,R0
+003A: D7      MOV PSW,A
+003B: 8A 48   ORL P2,#$48      ; pull low both clocks: disable device communication 
+003D: 23 02   MOV A,#$02       ; load A=02
+003F: 93      RETR             ; and return as if return from the interrupted routine
+
+
+>>>>>>>> IBF interrupt
+  ; This is not supposed to happen. The IBF interrupt is enabled by the EN I instruction, 
+  ; and this never occurres in the ROM. Also, RESET will disable all interrupts. 
+  ; We just disable IBF Interrupt and count this erroneous occurrence 
+  ; in $2F until the value of FFh. Then jump back to the Main Loop. 
+  
+0040: 65      STOP TCNT
+0041: 15      DIS I
+0042: B8 2F   MOV R0,#$2F      ; inc $2F
+0044: F0      MOV A,@R0
+0045: 17      INC A
+0046: C6 49   JZ $0049         ; don't wrap, max FF
+0048: A0      MOV @R0,A
+0049: 64 88   JMP $0388        ; ---> Main Loop
+       
+ 
+>>>>>>>> Reset 
+
+004B: 23 4B   MOV A,#$4B       ; pull KBD/AUX CLK down, release KBD/AUX DATA high. Also set A20 and clr SYSTEM RESET. 
+004D: 3A      OUTL P2,A        ; 
+004E: 26 52   JNT0 $0052       ; KBD CLK down? -> ok 
+0050: 9A BF   ANL P2,#$BF      ;   no, stuck high: release 
+0052: 46 56   JNT1 $0056       ; AUX CLK down? -> ok
+0054: 9A F7   ANL P2,#$F7      ;   no, release
+
+0056: 09      IN A,P1          ; Sample high-nibble of Port-1 and store in STS (??? According to Schematics P1_4-7 are N/C)
+0057: 90      MOV STS,A        ; move to STS
+
+0058: D6 58   JNIBF $0058      ; ----- wait for AA command from host loop --------+
+005A: 23 10   MOV A,#$10                                                          |
+005C: 90      MOV STS,A        ; set b4 status (10h = "Got sth from host")        |
+005D: 22      IN A,DBB         ; read input buffer                                |
+005E: 76 62   JF1 $0062        ; Command?                                         |
+0060: 04 58   JMP $0058        ; no: wait again                                   |
+0062: D3 AA   XRL A,#$AA       ; command: AA command Self Test? OK ->             |
+0064: 96 58   JNZ $0058        ; no: wait again ----------------------------------+
+                                                      
+0066: 23 20   MOV A,#$20       ; got AA command Self Test
+0068: 90      MOV STS,A        ; set b5 status (20h = "AA command received") 
+0069: 96 6D   JNZ $006D        ; ok, next (this always jumps)
+006B: 04 58   JMP $0058        ; [never reached]
+006D: 27      CLR A            ; test accumulator
+006E: C6 72   JZ $0072         ; ok
+0070: 04 58   JMP $0058        ; not zero --> back to wait AA command
+0072: 97      CLR C            ; test Carry
+0073: E6 77   JNC $0077        ; ok
+0075: 04 58   JMP $0058        ; not ok --> back to wait AA command
+0077: A7      CPL C
+0078: F6 7C   JC $007C         ; ok
+007A: 04 58   JMP $0058        ; --> back to wait AA command
+007C: 23 30   MOV A,#$30       ; ok, set status (30h = "CPU is quite sane so far") 
+007E: 90      MOV STS,A
+
+007F: B8 00   MOV R0,#$00      ; test R0 for 00, 55 and AA
+0081: F8      MOV A,R0
+0082: 96 B2   JNZ $00B2        ; not ok --> back to wait AA command
+0084: B8 55   MOV R0,#$55      ; test R0
+0086: F8      MOV A,R0
+0087: D3 55   XRL A,#$55
+0089: 96 B2   JNZ $00B2        ; not ok --> back to wait AA command
+008B: B8 AA   MOV R0,#$AA      ; test R0
+008D: F8      MOV A,R0
+008E: D3 AA   XRL A,#$AA
+0090: 96 B2   JNZ $00B2        ; not ok --> back to wait AA command
+
+0092: B8 7F   MOV R0,#$7F      ; test 128 bytes RAM: fill 
+0094: F8      MOV A,R0
+0095: A0      MOV @R0,A        ; move value 7F to data memory location 7F
+0096: E8 94   DJNZ R0,$0094    ; fills RAM[01..7F] with 01..7F
+
+0098: B8 7F   MOV R0,#$7F      ; test RAM for filled values, then for 00, 55 and AA
+009A: F8      MOV A,R0         ; and leaves all RAM[01..7F] = 00
+009B: D0      XRL A,@R0
+009C: 96 B2   JNZ $00B2        ; not ok --> back to wait AA command
+009E: 23 55   MOV A,#$55
+00A0: A0      MOV @R0,A
+00A1: D0      XRL A,@R0
+00A2: 96 B2   JNZ $00B2        ; not ok --> back to wait AA command
+00A4: 23 AA   MOV A,#$AA
+00A6: A0      MOV @R0,A
+00A7: D0      XRL A,@R0
+00A8: 96 B2   JNZ $00B2        ; not ok --> back to wait AA command
+00AA: A0      MOV @R0,A        ; clear
+00AB: D0      XRL A,@R0        ; test again
+00AC: 96 B2   JNZ $00B2        ; not ok --> back to wait AA command
+00AE: E8 9A   DJNZ R0,$009A    ; loop
+
+00B0: E4 9A   JMP $079A        ; ---> ALL RAM OK and AA command received
+00B2: 04 58   JMP $0058        ; ---> err back to wait for AA command
+
+
+>>>>>>>>> JMP part of RESET: Test Timer Interrupt 
+
+00B4: 23 50   MOV A,#$50       ; set STS user bits (50h = "RAM, ROM OK")
+00B6: 90      MOV STS,A
+00B7: 27      CLR A
+00B8: 62      MOV T,A          ; move 0 to timer
+00B9: 25      EN TCNTI         ; enable timer interrupt
+00BA: B9 0F   MOV R1,#$0F
+00BC: 14 C8   CALL $00C8       ; --> delay 0Fh x 256 times
+00BE: 32 C6   JB1 $00C6        ; got interrupted? Not good.. Timer Failure (A=02) --> back and wait for AA command 
+00C0: B9 02   MOV R1,#$02      ; ok, not interrupted
+00C2: 14 C8   CALL $00C8       ; --> now call delay for 02h x 256 times
+00C4: 32 D2   JB1 $00D2        ; --> A=02? ok, seems like this should be interrupted to accept Timer interrupt working
+00C6: 04 58   JMP $0058        ; Not good: --> back and wait for AA command 
+
+
+>>>>>>>>> SUB Loop R1*256-times to test Timer-delay
+
+  ; Called twice: first with R1=0Fh (3840 x 2 DJNZ instr=7680. Timer incremented /32 = appx. 240 times <- this shouldn't be interrupted). 
+  ; Then the next call with R1=02h and this should be interrupted to accept Timer as OK. 
+
+00C8: 55      STRT T
+00C9: B8 00   MOV R0,#$00
+00CB: E8 CB   DJNZ R0,$00CB
+00CD: E9 CB   DJNZ R1,$00CB
+00CF: 65      STOP TCNT
+00D0: 00      NOP
+00D1: 83      RET
+
+
+>>>>>>>>> JMP: final stage of RESET, all OK
+
+  ; After Test Timer Interrupt passed
+  ; All RAM were init to zero, now set some defaults
+
+00D2: 23 60   MOV A,#$60       ; set STS user bits (60h = "RAM, ROM, TIMER OK")    
+00D4: 90      MOV STS,A        ;
+00D5: B8 20   MOV R0,#$20      ; INIT RAM VARIABLES
+00D7: B0 30   MOV @R0,#$30     ; $20 = 30h  <- disable KBD and AUX, XLAT off, IRQ disable
+00D9: 18      INC R0
+00DA: B0 01   MOV @R0,#$01     ; $21 = 01h  <- Resend count after parity error
+00DC: 18      INC R0
+00DD: B0 0B   MOV @R0,#$0B     ; $22 = 0Bh  <- Wait for receive KBD poll count
+00DF: B8 25   MOV R0,#$25
+00E1: B0 02   MOV @R0,#$02     ; $25 = 02h  <- ??? never used
+00E3: 18      INC R0
+00E4: 18      INC R0
+00E5: B0 F8   MOV @R0,#$F8     ; $27 = F8h  <- DATA BIT time-out value
+00E7: 18      INC R0
+00E8: B0 CE   MOV @R0,#$CE     ; $28 = CEh  <- Timer value for serial transmission (see PAGE 4)
+00EA: 18      INC R0
+00EB: B0 0B   MOV @R0,#$0B     ; $29 = 0Bh  <- ??? never used
+00ED: 18      INC R0
+00EE: B0 10   MOV @R0,#$10     ; $2A = 10h  <- ??? never used
+00F0: 18      INC R0
+00F1: B0 20   MOV @R0,#$20     ; $2B = 20h  <- RAM-base for R/W RAM Commands
+00F3: 18      INC R0
+00F4: B0 15   MOV @R0,#$15     ; $2C = 15h  <- ??? never used
+00F6: B8 30   MOV R0,#$30
+00F8: B0 0B   MOV @R0,#$0B     ; $30 = 0Bh  <- Wait for receive AUX poll count (same as KBD)
+00FA: BC 55   MOV R4,#$55      ; OK: load 55h to R4
+00FC: B9 00   MOV R1,#$00      ; R1=00, no error in STS
+00FE: E4 00   JMP $0700        ; --> Send R4 to Host from KBD (IRQ1 is yet disabled) --> then start the Main loop
+
+
+***************************************************************
+**                                                           **
+**      PAGE-1: PASSWORD SECURITY                            **
+**                                                           **
+***************************************************************
+
+>>>>>>>> SUB ROM chksum 
+0100: A3      MOVP A,@A        ; read page-1
+0101: 83      RET
+
+
+>>>>>>>> Match stored password
+
+  ; JMP after receiving from KBD when PASSWORD SECURITY BIT SET ($40_0=1). 
+  ; This routine receives a raw scancode in R4 (Set-2). Watches for breakcodes (F0), then uses the XLAT TABLE to translate it to Set-1. Then checks the keystroke against PASSWORD. First against two user bytes ($36 and $37) are matched first: if match wait for next keystroke (ignore shift/ctrl? can be loaded here?). R1 is kept (STS bits, not used here, only when PASSWORD SECURITY BIT is cleared will be sent to Host). 
+
+0102: FC      MOV A,R4         ; scancode  
+0103: F2 42   JB7 $0142        ; R4 bit7 set? (83, 84, E0 E1 F0)
+
+0105: E3      MOVP3 A,@A       ; not set (00-7F): lookup XLAT TABLE
+0106: AC      MOV R4,A         ; load R4
+0107: B8 2D   MOV R0,#$2D      ; add stored Breakcode bit ($2D_7)
+0109: F0      MOV A,@R0        ;
+010A: 4C      ORL A,R4         ; A = $2D | R4  (set bit7 for breakcodes)
+010B: B0 00   MOV @R0,#$00     ; clear $2D (breakcode bit)
+010D: F2 6F   JB7 $016F        ; breakcode? --> back to Security Main Loop 
+
+010F: B8 36   MOV R0,#$36      ; not breakcode: (R4=00..7F translated keystroke)
+0111: FC      MOV A,R4         
+0112: D0      XRL A,@R0        ; == $36? A user byte to match (eg. shift?) 
+0113: C6 6F   JZ $016F         ; --> Match? yes, ignore, wait for next.. back to Security Main Loop 
+
+0115: B8 37   MOV R0,#$37      ; Not match with $36: match $37?
+0117: FC      MOV A,R4
+0118: D0      XRL A,@R0        ; A == $37?
+0119: C6 6F   JZ $016F         ; --> yes, ignore, wait for next.. back to Security Main Loop 
+
+011B: B8 42   MOV R0,#$42      ; None of $36/$37 matches: check against stored string
+011D: F0      MOV A,@R0
+011E: A8      MOV R0,A         ; R0 = $42
+011F: FC      MOV A,R4         ; A=keystroke read
+0120: D0      XRL A,@R0        ; R4 == *$42? Matches Security String next byte? 
+0121: C6 29   JZ $0129         ; yes: inc pointer
+
+0123: B8 42   MOV R0,#$42
+0125: B0 50   MOV @R0,#$50
+0127: 24 6F   JMP $016F        ; --> wait for next..
+
+0129: B8 42   MOV R0,#$42      ; R4 == *$42: security string pointer
+012B: F0      MOV A,@R0
+012C: 17      INC A
+012D: A0      MOV @R0,A        ; $42++
+012E: A8      MOV R0,A
+012F: F0      MOV A,@R0        ; A = *$42: trailing zero-byte? 
+0130: 96 6F   JNZ $016F        ; --> no, more chars to check: wait for next.. back to Security Main Loop 
+
+0132: B8 40   MOV R0,#$40      ; OK, A = *$42 == 0: we have reached trailing zero-byte: PASSWORD MATCH
+0134: B0 00   MOV @R0,#$00     ; $40=0: clear PASSWORD SECURITY BIT
+0136: B9 00   MOV R1,#$00      ; R1: status=ok (maybe notification byte $34 send to Host)
+0138: B8 34   MOV R0,#$34
+013A: F0      MOV A,@R0        ; A = $34 
+013B: C6 97   JZ $0197         ; --> is $34 zero? yes, done, SECURITY UNLOCKED, go to Main Loop
+
+013D: AC      MOV R4,A         ; $34 is non-zero: reply $34 back to Host (notify Host)
+013E: B9 00   MOV R1,#$00      ; no error in STS
+0140: E4 00   JMP $0700        ; --> Send R4 to Host from KBD + IRQ1.. --> then back to Main loop
+
+0142: D3 F0   XRL A,#$F0       ; raw scan code bit7 set: F0? (=Set-2 break code)
+0144: 96 6F   JNZ $016F        ; not F0 (E0/E1, 83, 84): ignore --> back to Security Main Loop 
+0146: B8 2D   MOV R0,#$2D      ; yes F0: store Break Code Bit in $2D_7 
+0148: B0 80   MOV @R0,#$80     ; write 80h to $2D
+014A: 24 6F   JMP $016F        ; --> back to Security Main Loop 
+
+
+
+>>>>>>>>> JMP: Command A6: Enable Security
+
+014C: B8 42   MOV R0,#$42      ; 
+014E: B0 50   MOV @R0,#$50     ; $42 = 50h: pointer to first char of Security String
+0150: B8 50   MOV R0,#$50
+0152: F0      MOV A,@R0        ; load Security String first char to A
+0153: 96 57   JNZ $0157        ; non-zero: Security String installed
+0155: 64 88   JMP $0388        ; --> first char zero: no Security String installed, back to Main Loop (security is disabled)
+
+0157: B8 40   MOV R0,#$40      ; Security String installed: 
+0159: B0 01   MOV @R0,#$01     ; set SECURITY MODE: $40=1
+015B: 23 00   MOV A,#$00
+015D: 90      MOV STS,A        ; clear all user bits of STS
+015E: B8 33   MOV R0,#$33      ; check $33 (user byte to signal Host when security turned off)  
+0160: F0      MOV A,@R0
+0161: C6 6F   JZ $016F         ; $33=0? yes, done, --> enter Security Main Loop 
+
+0163: 02      OUT DBB,A        ; $33 is non-null: send $33 to Host  
+0164: B8 20   MOV R0,#$20      ; notify Host with IRQ1 if enabled
+0166: F0      MOV A,@R0
+0167: 37      CPL A
+0168: 12 6F   JB0 $016F        ; IRQ1 DIS? --> just enter Security Main Loop 
+
+016A: 8A 10   ORL P2,#$10      ; IRQ1 EN: assert IRQ1
+016C: 00      NOP              ; wait a little 
+016D: 9A CF   ANL P2,#$CF      ; clear IRQ1 and IRQ12
+                               ; fall thru --> enter Security Main Loop 
+
+
+>>>>>>>>> JMP: SECURITY MAIN LOOP
+
+  ; When PASSWORD SECURITY BIT SET ($40_0=1) we spin here, handle keystrokes and AUX, but AUX is not sent to Host. 
+  ; Host input is also ignored: IB not checked here (ie. no command/data can be sent to the controller)
+
+016F: B8 28   MOV R0,#$28
+0171: F0      MOV A,@R0
+0172: 62      MOV T,A          ; load TIMER from $28 (START-BIT/Condition PS/2)
+0173: 9A 03   ANL P2,#$03      ; pull up (release) ALL 4 lines, clear IRQ1/12 and wait..
+
+0175: 26 7B   JNT0 $017B       ; KBD CLK low?  --------- Wait and poll either CLK ------------------+
+0177: 46 7F   JNT1 $017F       ; AUX CLK low?                                                       |
+0179: 24 75   JMP $0175        ; no, just loop                                                      |
+017B: 36 75   JT0 $0175        ; KBD CLK low: high? poll again (unstable)                           |
+017D: C4 02   JMP $0602        ; ---> KBD CLK pulled low: read from KBD                             |
+017F: 56 75   JT1 $0175        ; AUX CLK low: high? poll again (unstable)                           |
+0181: C4 70   JMP $0670        ; ---> AUX CLK pulled low: read from AUX without reply to Host  -----+
+
+
+>>>>>>>>> JMP: Command A5: Load Security
+
+  ; Bytes written to Data port 0x60 by Host will be read until zero, it copies the "Password" to RAM as a C-string
+  ; Later, by receiving Command A6: Enable Security will check $50 for non-zero then 8042 enters the Security Main Loop. 
+
+0183: B8 50   MOV R0,#$50
+0185: D6 85   JNIBF $0185      ; ..Wait for Host input.. 
+0187: 76 93   JF1 $0193        ; Host Command? --> back to Main Loop
+0189: 22      IN A,DBB         ; data 0x60, read in
+018A: A0      MOV @R0,A        ; write bytes to RAM from $50..
+018B: C6 97   JZ $0197         ; zero? DONE, --> back to Main Loop
+018D: 18      INC R0           ; non-zero
+018E: F8      MOV A,R0         
+018F: D3 7F   XRL A,#$7F       ; until max $7f
+0191: 96 85   JNZ $0185        ; wait again
+
+0193: B8 50   MOV R0,#$50      ; reached 7F: too long, write zero to $50 Security String[0] (=NOT LOADED)
+0195: B0 00   MOV @R0,#$00
+0197: 64 88   JMP $0388        ; --> back to Main Loop
+
+
+>>>>>>>>> JMP: Command A4: Password Installed Test
+
+Simply tests $50 for zero: replies with FAh=Password installed, F1h=No password
+
+0199: B8 50   MOV R0,#$50
+019B: F0      MOV A,@R0        ; read $50
+019C: C6 A2   JZ $01A2
+019E: BC FA   MOV R4,#$FA      ; $50 non-zero: send FAh to Host
+01A0: 24 A4   JMP $01A4
+01A2: BC F1   MOV R4,#$F1      ; $50 zero, no PASSWORD: send F1h to Host
+01A4: B9 00   MOV R1,#$00      ; no error in STS
+01A6: E4 00   JMP $0700        ; --> Send R4 to Host from KBD + IRQ1.. --> then back to Main loop
+
+
+>>>>>>>>> ???? Orphan, never executed 
+
+01A8: B8 35   MOV R0,#$35
+01AA: F0      MOV A,@R0
+01AB: 07      DEC A
+01AC: C6 97   JZ $0197             
+01AE: 24 AB   JMP $01AB
+
+01B0: 00 00 00 00 00 00 00 00 00 .. 
+
+
+**********************************************************************
+**                                                                  **
+**         PAGE-2: Sending PS/2 protocol                            **
+**         Two identical sub-routines for KBD and AUX:              **
+**             sending to device and receiving response             **
+**             transmit serial data to device                       **
+**                                                                  **
+**********************************************************************
+
+Two identical sub-routines for KBD and AUX:
+
+         >> 0202: Send to KBD <<                                  >> 027E: Send to AUX <<                        
+                   |                                                        |                                    
+           clear KBD DIS in $20                                     clear AUX DIS in $20                         
+                   |                                                        |                                    
+           022C: Transmit to KBD                                    02A8: Transmit to AUX                        
+                   |                                                        |                                    
+                time-out? ------------> R4=NACK (STS=40)                 time-out? ------------> R4=NACK (STS=40)
+                   |                        |                               |                        |           
+      +----<---- $22=00?                    |                  +----<---- $30=00?                    |           
+      |            |                        |                  |            |                        |           
+      |  0402: Receive response from KBD    |                  |  0457: Receive response from AUX    |           
+      |          in R4                      |                  |          in R4                      |           
+      |            |                        |                  |            |                        |           
+      |         parity err? ----------> R4=NACK (STS=C0)       |         parity err? ----------> R4=NACK (STS=C0)
+      |            |                        |                  |            |                        |           
+      |         time-out? ------------> R4=NACK (STS=C0)       |         time-out? ------------> R4=NACK (STS=C0)
+      |            |                        |                  |            |                        |           
+      |          STS=00                     |                  |          STS=00                     |           
+      |            |                        |                  |            |                        |           
+      |  0700: Send R4 to Host from KBD <---+                  |  071A: Send R4 to Host from AUX <---+           
+      |        and set STS                                     |        and set STS                              
+      |            |                                           |            |                                    
+      +-------> Main Loop                                      +-------> Main Loop
+
+
+
+>>>>>>>> SUB ROM chksum 
+0200: A3      MOVP A,@A        ; read page-2
+0201: 83      RET
+
+
+************************************************
+**   JMP: Send to KBD and receive response    **
+************************************************
+
+From Main Loop when Host has written 0x60 (IBF=1, F1=0). 
+Byte written to 0x60 will be transmitted to the KBD device. 
+If transmission goes well, wait and receive response byte. If all OK, send response byte to Host from KBD. 
+On parity or time-out error sends FEh (NACK) to Host and set STS error bits. 
+
+0202: 22      IN A,DBB         ; read in byte to send 
+0203: AC      MOV R4,A         ; into R4
+0204: B8 20   MOV R0,#$20
+0206: F0      MOV A,@R0
+0207: 53 EF   ANL A,#$EF
+0209: A0      MOV @R0,A        ; clear KBD DIS in $20
+020A: 54 2C   CALL $022C       ; --> Transmit to KBD (error code in A)
+
+020C: 9A 7F   ANL P2,#$7F      ; release KBD DATA (high) - on error might stays low? 
+
+020E: B9 40   MOV R1,#$40      ; set STS=40h in case of time-out error: 
+0210: 32 26   JB1 $0226        ; time-out error? -> send FEh to Host (NACK)
+
+0212: B8 22   MOV R0,#$22      : no time-out: 
+0214: F0      MOV A,@R0        ; load $22 into A (INIT to 0Bh at RESET)
+0215: C6 2A   JZ $022A         ; is it zero? Loop-count is zero, ignore response byte(?) --> back to Main Loop
+
+0217: A9      MOV R1,A         : non zero $22 -> into R1 (wait poll loop for response R1*256-times)   
+0218: 94 02   CALL $0402       ; --> KBD now is supposed to send a response byte: Wait for and receive response from KBD into R4 (error code in A)
+
+021A: B9 C0   MOV R1,#$C0      ; set STS C0h
+021C: 12 26   JB0 $0226        ; parity error? reply FEh to Host (NACK)
+
+021E: B9 C0   MOV R1,#$C0      ; set STS C0h
+0220: 32 26   JB1 $0226        ; time-out error? reply FEh to Host (NACK)
+
+0222: B9 00   MOV R1,#$00      ; OK receiving response: no error in status bits 
+0224: 44 28   JMP $0228        ; --> send response byte from KBD in R4 to Host (possibly FAh = ACK) + IRQ --> then back to Main Loop 
+
+0226: BC FE   MOV R4,#$FE      ; send FEh to Host (NACK)
+0228: E4 00   JMP $0700        ; --> Send R4 to Host from KBD + IRQ.. then ---> back to Main Loop
+022A: 64 88   JMP $0388        ; --> back to Main Loop
+
+
+
+***************************************
+**   SUB: Transmit to KBD device     ** 
+***************************************
+
+Called from the above (Host has written 0x60) or when sending FEh = Resend command after receiving with parity error
+
+                               ; Request-to-send state of the bus: 
+                               ; 1. Host pulls CLK low.. pulls DATA low.. waits 100us.. releases CLK
+                               ; 2. Then device start generating clock pulses..
+                               ; 3. Host writes data when CLK falls, i.e low
+                               ; 4. Device clocks in data on rising edges 9 times (8 bit data + parity) 
+                               ; 
+                               ; R4: byte to send 
+                               ; $26: START BIT time-out value: 0 (zero at init, we give good time for device to answer)
+                               
+022C: 8A C8   ORL P2,#$C8      ; pull AUX CLK low too (inhibit), pull KBD CLK and DATA low (start RTS): 
+                               ;  __  
+                               ; C  \_
+                               ;  __  
+                               ; D  \_
+                               
+022E: B8 26   MOV R0,#$26      ; Have to keep CLK low for a while anyway, so do some instructions
+0230: F0      MOV A,@R0
+0231: 62      MOV T,A          ; load TIMER from $26 = 00h (RTS condition is a little longer than clocking data)
+0232: B8 27   MOV R0,#$27      ; $27: DATA BIT time-out value = F8h
+0234: BA 08   MOV R2,#$08      ; 8 times data bits written 
+0236: BB 00   MOV R3,#$00      ; parity-counter 
+0238: 55      STRT T           ; and start timer 
+0239: 9A BF   ANL P2,#$BF      ; Release KBD CLK up. This is the RTS state: now device takes over the CLK line and starts generating clock pulses
+                               ;  __     _
+                               ; C  \___/
+                               ;  __  
+                               ; D  \_____
+                               
+023B: FC      MOV A,R4         ; --------------------------------------------------------+
+023C: 67      RRC A            ; 8042 writes bits when CLK is low                        |
+023D: AC      MOV R4,A         ; rotate R4 -> lsb into Carry                             |
+023E: 36 3E   JT0 $023E        ; .. wait for device pull KBD CLK low ..                  |
+                               ;  __     ____                                            |
+                               ; C  \___/    \_                                          |
+                               ;  __                                                     |
+                               ; D  \__________                                          |
+0240: F6 46   JC $0246         ; Carry set?                                              |
+0242: 8A 80   ORL P2,#$80      ; write KBD DATA '0'                                      |
+0244: 44 49   JMP $0249                                                                  |
+0246: 9A 7F   ANL P2,#$7F      ; write KBD DATA '1'                                      |
+0248: 1B      INC R3           ;   count '1's                                            |
+                               ;  __     ____                                            |
+                               ; C  \___/    \__                                         |
+                               ;  __           ^                                         |
+                               ; D  \__________X                                         |
+0249: 65      STOP TCNT                                                                  |
+024A: F0      MOV A,@R0                                                                  |
+024B: 62      MOV T,A          ; set timer from $27 (for clocking data)                  |
+024C: 55      STRT T                                                                     |
+024D: 26 4D   JNT0 $024D       ; .. wait for KBD CLK goes up .. (device clocks in data)  |
+                               ;  __     ____     _                                      |
+                               ; C  \___/    \___/                                       |
+                               ;  __           ^                                         |
+                               ; D  \__________X                                         |
+024F: EA 3B   DJNZ R2,$023B    ; do this 8 times  ---------------------------------------+
+
+0251: 23 01   MOV A,#$01       ; PARITY BIT:
+0253: DB      XRL A,R3
+0254: 67      RRC A            ; put into Carry
+0255: 36 55   JT0 $0255        ; .. wait for KBD CLK falls ..
+0257: F6 5D   JC $025D         ; Carry set? 
+0259: 8A 80   ORL P2,#$80      ; write parity '0'
+025B: 44 5F   JMP $025F
+025D: 9A 7F   ANL P2,#$7F      ; write parity '1'
+025F: 65      STOP TCNT        ; 
+                               ;  __     ____     __       __
+                               ; C  \___/    \___/  \__...   \__
+                               ;  __           ^      ^        ^
+                               ; D  \__________0      1 ...    P
+                               
+0260: F0      MOV A,@R0        ; STOP BIT: 
+0261: 62      MOV T,A          ; set timer from $27 (same as for clocking data)
+0262: 55      STRT T
+0263: 26 63   JNT0 $0263       ; .. wait for KBD CLK goes up .. 
+0265: 44 67   JMP $0267        ; slight delay
+0267: 36 67   JT0 $0267        ; .. wait for KBD CLK goes down ..
+0269: 9A 7F   ANL P2,#$7F      ; write STOP BIT HIGH
+026B: 65      STOP TCNT
+                               ;  __     ____     __       __     __
+                               ; C  \___/    \___/  \__...   \___/  \_______
+                               ;  __           ^      ^        ^      _______
+                               ; D  \__________0      1 ...    P     /STOP
+                               
+026C: F0      MOV A,@R0        ; receive ACK bit: 
+026D: 62      MOV T,A          ; set timer from $27 (same as for clocking data)
+026E: 55      STRT T
+026F: 09      IN A,P1          ; sample KBD DATA for ACK (low)
+0270: 12 6F   JB0 $026F        ; .. loop until puled low ..
+0272: 44 74   JMP $0274        ; slight delay
+0274: 09      IN A,P1          ; sample KBD DATA.. --------------------+
+0275: 37      CPL A                                                    |
+0276: 12 74   JB0 $0274        ; ..loop until KBD DATA released (up) --+
+                               ;  __     ____     __       __     __     __     ___
+                               ; C  \___/    \___/  \__...   \___/  \___/  \___/    
+                               ;  __           ^      ^        ^      _____       _
+                               ; D  \__________0      1 ...    P     /STOP \_ACK_/
+                               
+0278: 65      STOP TCNT
+0279: 00      NOP
+027A: 8A 48   ORL P2,#$48      ; now be quiet on the bus: pull both clocks down
+027C: 27      CLR A
+027D: 83      RET              ; return 00 OK
+
+
+
+************************************************
+**   JMP: D4 Command                          **
+**        Send to AUX and receive response    **
+************************************************
+     
+D4 Command: send next byte to AUX, receive reply and send back to Host (identical to KBD) . 
+When Hosts writes 0x64 with D4, the next byte written to 0x60 will be transmitted to the AUX device. 
+If transmission goes well, wait and receive response byte. If all OK, send byte to Host from AUX (possibly FAh=ACK or any other response). 
+On parity or time-out error sends FEh (NACK) to host. 
+
+027E: 22      IN A,DBB         ; read in byte to send
+027F: AC      MOV R4,A         ; into R4                                                                                       
+0280: B8 20   MOV R0,#$20                                                                                                      
+0282: F0      MOV A,@R0                                                                                                        
+0283: 53 DF   ANL A,#$DF                                                                                                       
+0285: A0      MOV @R0,A        ; clear AUX DIS in $20                                                                          
+0286: 54 A8   CALL $02A8       ; ---> Transmit to AUX (error code in A)                                                    
+                                                                                                       
+0288: 9A FB   ANL P2,#$FB      ; release AUX DATA (high) - on error might stays low?                                                                                                                             
+028A: B9 40   MOV R1,#$40      ; set STS 40h                                                                            
+028C: 32 A2   JB1 $02A2        ; time-out error? send FEh to Host (NACK)                                                       
+                                                                                                                               
+028E: B8 30   MOV R0,#$30      : no time-out:                                                                                  
+0290: F0      MOV A,@R0        ; load $30 into A (INIT to 0Bh at RESET)                                                        
+0291: C6 A6   JZ $02A6         ; is it zero? Loop-count is zero, ignore response byte(?) --> just back to Main Loop                 
+                                                                                                                               
+0293: A9      MOV R1,A         : non zero $30 -> into R1 (wait poll loop for response R1*256-times)                  
+0294: 94 57   CALL $0457       ; ---> AUX now is supposed to send a response byte: Wait for and receive response from AUX into R4 (error code in A)
+                                                                                                                               
+0296: B9 C0   MOV R1,#$C0      ; set STS C0h                                                                                   
+0298: 12 A2   JB0 $02A2        ; parity error? reply FEh to Host (NACK)                                                        
+                                                                                                                               
+029A: B9 C0   MOV R1,#$C0      ; set STS C0h                                                                                   
+029C: 32 A2   JB1 $02A2        ; time-out error? reply FEh to Host (NACK)                                                      
+                                                                                                                               
+029E: B9 00   MOV R1,#$00      ; OK receiving response: no error in status bits                                                
+02A0: 44 A4   JMP $02A4        ; ---> send response byte in R4 to Host (possibly FAh = ACK) + IRQ                              
+                                                                                                                               
+02A2: BC FE   MOV R4,#$FE      ; send FEh to Host (NACK)                                                                       
+02A4: E4 1A   JMP $071A        ; ---> Send to Host from AUX + IRQ12.. ---> then back to Main Loop  
+02A6: 64 88   JMP $0388        ; ---> back to Main Loop                                                                        
+
+
+***************************************
+**   SUB: Transmit to AUX device     ** 
+***************************************
+Identical to KBD
+Called from the above (D4 Command) or when sending the FEh = Resend command during receive and parity error.  
+
+02A8: 8A 4C   ORL P2,#$4C
+02AA: B8 26   MOV R0,#$26
+02AC: F0      MOV A,@R0
+02AD: 62      MOV T,A
+02AE: B8 27   MOV R0,#$27
+02B0: BA 08   MOV R2,#$08
+02B2: BB 00   MOV R3,#$00
+02B4: 55      STRT T
+02B5: 9A F7   ANL P2,#$F7
+02B7: FC      MOV A,R4
+02B8: 67      RRC A
+02B9: AC      MOV R4,A
+02BA: 56 BA   JT1 $02BA
+02BC: F6 C2   JC $02C2
+02BE: 8A 04   ORL P2,#$04
+02C0: 44 C5   JMP $02C5
+02C2: 9A FB   ANL P2,#$FB
+02C4: 1B      INC R3
+02C5: 65      STOP TCNT
+02C6: F0      MOV A,@R0
+02C7: 62      MOV T,A
+02C8: 55      STRT T
+02C9: 46 C9   JNT1 $02C9
+02CB: EA B7   DJNZ R2,$02B7
+02CD: 23 01   MOV A,#$01
+02CF: DB      XRL A,R3
+02D0: 67      RRC A
+02D1: 56 D1   JT1 $02D1
+02D3: F6 D9   JC $02D9
+02D5: 8A 04   ORL P2,#$04
+02D7: 44 DB   JMP $02DB
+02D9: 9A FB   ANL P2,#$FB
+02DB: 65      STOP TCNT
+02DC: F0      MOV A,@R0
+02DD: 62      MOV T,A
+02DE: 55      STRT T
+02DF: 46 DF   JNT1 $02DF
+02E1: 44 E3   JMP $02E3
+02E3: 56 E3   JT1 $02E3
+02E5: 9A FB   ANL P2,#$FB
+02E7: 65      STOP TCNT
+02E8: F0      MOV A,@R0
+02E9: 62      MOV T,A
+02EA: 55      STRT T
+02EB: 09      IN A,P1
+02EC: 32 EB   JB1 $02EB
+02EE: 44 F0   JMP $02F0
+02F0: 09      IN A,P1
+02F1: 37      CPL A
+02F2: 32 F0   JB1 $02F0
+02F4: 65      STOP TCNT
+02F5: 00      NOP
+02F6: 8A 48   ORL P2,#$48
+02F8: 27      CLR A
+02F9: 83      RET
+
+02FA: 00      NOP
+02FB: 00      NOP
+02FC: 00      NOP
+02FD: 00      NOP
+02FE: 00      NOP
+02FF: 00      NOP
+
+
+
+
+*******************************************
+**                                       **
+**  PAGE-3: XLAT TABLE and Main loop     **
+**                                       **
+*******************************************
+
+The table is identical to the 8042 AT ROM's table. The 84-key AT keyboard sends Set-2 makecodes of 01..7F (with the exception of 83h/84h, but these are translated back to 02h/7fh by the 8042 before XLAT table lookup). This Set-2 list has 'holes', makecodes that are never sent. Used makecodes map to 01..54h by this table nicely (Set-1). For the rest IBM decided to 'fill out' the table with different codes, possibly thinking about future keyboards with more keys. Indeed, the PS/2 (and earlier in 1986 the AT was also) shipped with the 101/102-key Keyboard - but peculiarly instead of just extending the 1-byte makecode list for this keyboard, the new keys send multibyte 'escaped' makecodes (E0/E1) to the system. And many other details, like 3 scancode sets, shift states, etc. This is where the scancode-horror begun.. and the BIOS had to do all the work. Note that the AT-keyboard's buffer overrun code (00) differs from the XT's (FF). 
+
+0300: FF 43 41 3F 3D 3B 3C 58 | 64 44 42 40 3E 0F 29 59 | .CA?=;<XdDB@>.)Y
+0310: 65 38 2A 70 1D 10 02 5A | 66 71 2C 1F 1E 11 03 5B | e8*p...Zfq,....[
+0320: 67 2E 2D 20 12 05 04 5C | 68 39 2F 21 14 13 06 5D | g.- ...\h9/!...]
+0330: 69 31 30 23 22 15 07 5E | 6A 72 32 24 16 08 09 5F | i10#"..^jr2$..._
+0340: 6B 33 25 17 18 0B 0A 60 | 6C 34 35 26 27 19 0C 61 | k3%....`l45&'..a
+0350: 6D 73 28 74 1A 0D 62 6E | 3A 36 1C 1B 75 2B 63 76 | ms(t..bn:6..u+cv
+0360: 55 56 77 78 79 7A 0E 7B | 7C 4F 7D 4B 47 7E 7F 6F | UVwxyz.{|O}KG~o
+0370: 52 53 50 4C 4D 48 01 45 | 57 4E 51 4A 37 49 46 54 | RSPLMH.EWNQJ7IFT
+
+>>>>>>>>> ???? Orphan, never executed 
+
+0380: B6 BD   JF0 $03BD
+0382: B2 DF   JB5 $03DF
+0384: CE      DEC R6
+0385: C6 C7   JZ $03C7
+0387: C8      DEC R0
+
+************************************
+**                                **
+**        THE MAIN LOOP           **
+**                                **
+************************************
+
+- polls IB (Host written to 0x60/0x64)
+- poll KBD CLK for stable low
+- poll AUX CLK for stable low 
+
+        
+0388: D6 90   JNIBF $0390      ; IB empty?
+038A: 76 8E   JF1 $038E        ; IB Full. Host has written something into buffer: 
+038C: 44 02   JMP $0202        ; ---> Data: send to KBD.. and send response back to Host
+038E: A4 02   JMP $0502        ; ---> Command: process
+0390: 86 88   JOBF $0388       ; OB full? Host hasn't read it yet: wait and loop
+
+0392: B8 28   MOV R0,#$28      ; Both IB and OB empty (IDLE Host activity): take care of devices
+0394: F0      MOV A,@R0        
+0395: 62      MOV T,A          ; set Timer from $28 (START BIT)
+
+0396: B8 20   MOV R0,#$20      ; ------------------------------------------------------------+
+0398: F0      MOV A,@R0                                                                      |
+0399: B2 A3   JB5 $03A3        ; $20 bit5 AUX DIS?                                           |
+                                                                                             |
+039B: 9A F7   ANL P2,#$F7      ; AUX EN: release AUX CLK high                                |
+039D: 92 B1   JB4 $03B1        ; KBD DIS? -> do mouse only                                   |
+039F: 9A BF   ANL P2,#$BF      ; KBD EN also: pull KBD CLK high                              |
+03A1: 64 B9   JMP $03B9        ;                                                             |
+03A3: 92 88   JB4 $0388        ; AUX DIS: KBD DIS also? ---> Main Loop                       |
+03A5: 9A BF   ANL P2,#$BF      ; AUX DIS, KBD EN: release KBD CLK (high)                     |
+03A7: 64 A9   JMP $03A9        ; do KBD (jumps to next)                                      |
+03A9: 26 C3   JNT0 $03C3       ; KBD CLK low?  ---------------------------------------+      |
+03AB: D6 A9   JNIBF $03A9      ; KBD CLK high: check IB in the meantime.. nothing? ---+      |
+03AD: 8A 48   ORL P2,#$48      ; Host written: pull both clocks low (inhibit communication)  |
+03AF: 64 8A   JMP $038A        ; ---> and process Host byte                                  |
+                                                                                             |
+03B1: 46 C9   JNT1 $03C9       ; AUX EN only loop: AUX CLK pulled low? ---------------+      |
+03B3: D6 B1   JNIBF $03B1      ; no, Host didn't write? loop -------------------------+      |
+03B5: 8A 48   ORL P2,#$48      ; Host written: pull both clocks low (inhibit communication)  |
+03B7: 64 8A   JMP $038A        ; ---> and process Host byte                                  |
+                                                                                             |
+                               ; Both devices enabled: poll clocks and IB from Host in loop  |
+03B9: 26 C3   JNT0 $03C3       ;   -------+    KBD CLK pulled low?                           |
+03BB: 46 C9   JNT1 $03C9                  |    AUX CLK pulled low?                           |
+03BD: D6 B9   JNIBF $03B9      ; ---------+    IB full?                                      |
+                                                                                             |
+03BF: 8A 48   ORL P2,#$48      ; Host has written: pull both clocks low (inhibit devices)    |
+03C1: 64 8A   JMP $038A        ; ---> and process Host byte                                  |
+                                                                                             |
+03C3: 36 CF   JT0 $03CF        ; KBD CLK pulled low: high again?                             |
+03C5: 8A 08   ORL P2,#$08      ; still low, OK, KBD pulled CLK stable low (pull AUX CLK low: inhibit)
+03C7: C4 02   JMP $0602        ; ---> read PS/2 KBD and send to Host                         |
+                                                                                             |
+03C9: 56 D5   JT1 $03D5        ; AUX CLK pulled low: high again?                             |
+03CB: 8A 40   ORL P2,#$40      ; still low, OK, AUX pulled CLK stable low (pull KBD CLK low: inhibit)
+03CD: C4 70   JMP $0670        ; ---> read PS/2 AUX and send to Host                         |
+                                                                                             |
+03CF: 8A 48   ORL P2,#$48      ; KBD CLK high-low-high: pull both clocks low (inhibit communication)
+03D1: B8 24   MOV R0,#$24      ; inc $24: KBD "glitch" counter                               |
+03D3: 64 D9   JMP $03D9        ;                                                             |
+03D5: 8A 48   ORL P2,#$48      ; AUX CLK high-low-high: pull both clocks low (inhibit communication)
+03D7: B8 32   MOV R0,#$32      ; inc $32: AUX "glitch" counter                               |                                                                                   |
+03D9: F0      MOV A,@R0                                                                      |
+03DA: 17      INC A                                                                          |
+03DB: C6 96   JZ $0396         ; zero? Leave $24/$32 = FFh and loop -------------------------+
+03DD: A0      MOV @R0,A        ; non-zero: write back $24/$32                                |
+                                                                                             |
+03DE: 64 96   JMP $0396        ; loop -------------------------------------------------------+
+
+
+
+>>>>>>>>> SUB: 01xx xxxx/00xx xxxx Command: read/write RAM address
+Host byte in A. Returns an address of normally 20..3F in A. 
+By setting RAM BASE in $2B reading below $20 would be possible. 
+But not higher than $3F (it would be fun to read out the password..).
+
+03E0: 53 3F   ANL A,#$3F       ; keep 00xx xxxx (00..3F)
+03E2: B2 E7   JB5 $03E7        ; >=20? -> done
+03E4: B8 2B   MOV R0,#$2B      ; no, 000x xxxx (00..1F): add RAM-BASE ($2B=20h default) 
+03E6: 60      ADD A,@R0        ; 
+03E7: A8      MOV R0,A         ; save in R0
+03E8: 03 C0   ADD A,#$C0
+03EA: E6 EE   JNC $03EE        ; Carry not set (3F+C0=FF) -> just return 20..3F
+03EC: B8 3E   MOV R0,#$3E      ; >3F: impossible to read these RAM locations above: return 3E
+03EE: F8      MOV A,R0         ; restore A from R0 and return RAM address in A
+03EF: 83      RET
+
+03F0: 00 .. ..
+
+
+*********************************************************
+**                                                     **
+** PAGE-4: Receiving from device protocol              **
+** Two identical subroutines for reading KBD and AUX   **
+**    Wait for response from device                    **
+**    Transmit from device                             **
+**                                                     **
+*********************************************************
+
+>>>>>>>>> SUB used during RESET
+0400: A3      MOVP A,@A
+0401: 83      RET
+
+>>>>>>>>> SUB: Waiting for KBD and receive response after sending
+
+Called after Host written 0x60 and byte sent to KBD, or Resend after parity error. 
+An extensive loop of R1*256 times that polls CLK for stable low several times. 
+R1=0B (loaded from $22, init 0Bh at RESET) or R1=29h after parity error and Resend (FEh) has been sent.  
+When CLK is stable low, falls through to the next subroutine and receives serial transmission from device. 
+If device not responding, returns time-out error (A=02). Check for parity-error (A=01), otherwise A=00 and R4 is byte received.  
+
+0402: B8 28   MOV R0,#$28      ; load timer from $28 for START bit 
+0404: F0      MOV A,@R0
+0405: 62      MOV T,A
+
+0406: 9A BF   ANL P2,#$BF      ; release KBD CLOCK: pull high
+0408: 27      CLR A            ; ---- Wait and poll for CLK low R1*256 times ---+
+0409: 26 2E   JNT0 $042E       ; KBD CLK low? break ------------------------+   |
+040B: 17      INC A            ; still high: wait in a loop of 256 times    |   |
+040C: C6 12   JZ $0412         ;                                            |   |
+040E: 26 2E   JNT0 $042E       ; KBD CLK low? break                         |   |
+0410: 84 09   JMP $0409        ; still high: 256 loop  ---------------------+   |
+0412: 26 2E   JNT0 $042E       ; KBD CLK low? break                             |
+0414: C9      DEC R1           ; still high:                                    |
+0415: F9      MOV A,R1         ;                                                |
+0416: 96 08   JNZ $0408        ; R1 loop  --------------------------------------+
+0418: 84 29   JMP $0429        ; loop expired R1 x 256 times: --> return time-out
+
+041A: AA      MOV R2,A         ; we come back here and loop again when CLK low was not stable: pulled low but is high again (what does that mean? noise? device is in middle of sending?)
+041B: 8A 48   ORL P2,#$48      ; pull both CLK low (inhibit)
+041D: FA      MOV A,R2         ; see if there is more to loop: if yes, release CLK and continue
+041E: 17      INC A            ;   if not: --> return time-out 
+041F: C6 25   JZ $0425         ; no more loop in A?
+0421: 9A BF   ANL P2,#$BF      ; yes, more inner loop: release CLK and 
+0423: 84 09   JMP $0409        ;   --> back to wait loop 
+0425: C9      DEC R1           ;
+0426: F9      MOV A,R1
+0427: 96 06   JNZ $0406        ; more outer loop? yes, --> back to wait loop (otherwise return time-out)
+
+0429: 8A 48   ORL P2,#$48      ; pull both CLK low (inhibit)
+042B: 23 02   MOV A,#$02       ; return time-out (no response from device)
+042D: 83      RET
+
+042E: 36 1A   JT0 $041A        ; KBD CLOCK not stable low? go back and continue the wait loop
+                               ; OK, CLOCK stable low: fall thru and receive transmission from device
+
+
+>>>>>>>>> SUB: Receive serial transmission from KBD (8 DATA + PARITY)
+
+We enter here from Main Loop when KBD pulled CLK stable low.  
+Runs under time-out interrupt.
+Result in R4, error code in A 
+
+                               ;   __
+                               ;  C  \____
+                               ;   _______
+                               ;  D
+0430: BA 09   MOV R2,#$09      ; we'll sample 9 bits from KBD DATA after falling CLK edges
+0432: BB 00   MOV R3,#$00      ; counter for one's (parity bit set when even number of 1's: complement lsb at the end)
+0434: 55      STRT T           ; pre-loaded from $28 in Main Loop (returns A=02 on time-out) 
+
+0435: 26 35   JNT0 $0435       ; .. wait for KBD CLK high .. --------------------+
+                               ;   __      _                                     |
+                               ;  C  \____/                                      |
+                               ;   _______                                       |
+                               ;  D                                              |
+0437: FC      MOV A,R4         ; rotate right R4 thru Carry                      |
+0438: 67      RRC A            ; lsb -> Carry                                    |
+0439: AC      MOV R4,A                                                           |
+043A: 36 3A   JT0 $043A        ; .. wait for KBD CLK low ..                      |
+                               ;   __      __                                    |
+                               ;  C  \____/  \_                                  |
+                               ;   _______                                       |
+                               ;  D                                              |
+                               ;                                                 |
+043C: 97      CLR C            ; now sample KBD DATA and put it into Carry       |
+043D: 09      IN A,P1          ;                                                 |
+                               ;   __      __                                    |
+                               ;  C  \____/  \__                                 |
+                               ;   _______     ^                                 |
+                               ;  D            0                                 |
+043E: 37      CPL A                                                              |
+043F: 12 43   JB0 $0443        ; read 0? loop                                    |
+0441: A7      CPL C            ; read 1: also inc PARITY counter in R3           |
+0442: 1B      INC R3                                                             |
+0443: EA 35   DJNZ R2,$0435    ; do this 9 times --------------------------------+
+
+0445: 26 45   JNT0 $0445       ; .. wait for KBD CLK high .. (we don't sample STOP BIT) 
+0447: 84 49   JMP $0449        ; wait a little
+0449: 36 49   JT0 $0449        ; .. wait for KBD CLK low .. 
+                               ;   __      __     __     __                __     __   
+                               ;  C  \____/  \___/  \___/  \__          __/  \___/  \_
+                               ;   ______      ^      ^      ^          ^      ^     
+                               ;  D            0      1      2   ....   7      P     
+044B: 65      STOP TCNT        ; OK, stop counter 
+044C: 00      NOP              ; wait a little 
+044D: 8A 48   ORL P2,#$48      ; pull both clocks low (inhibit)
+044F: FB      MOV A,R3         ; check parity
+0450: 12 55   JB0 $0455        ; odd? OK
+0452: 23 01   MOV A,#$01       ; even, not good
+0454: 83      RET              ; return A=01: parity error
+0455: 27      CLR A            ; return A=00: OK
+0456: 83      RET
+
+
+>>>>>>>>> SUB: Waiting for AUX and receive response after sending a byte
+Identical to KBD
+R1: Poll loop count loaded from $30 (default =0Bh) when called from D4 command, or 29h after Resend sent because of parity error.  
+
+0457: B8 28   MOV R0,#$28
+0459: F0      MOV A,@R0
+045A: 62      MOV T,A    
+045B: 9A F7   ANL P2,#$F7
+045D: 27      CLR A      
+045E: 46 83   JNT1 $0483 
+0460: 17      INC A      
+0461: C6 67   JZ $0467
+0463: 46 83   JNT1 $0483 
+0465: 84 5E   JMP $045E  
+0467: 46 83   JNT1 $0483 
+0469: C9      DEC R1     
+046A: F9      MOV A,R1   
+046B: 96 5D   JNZ $045D  
+046D: 84 7E   JMP $047E  
+046F: AA      MOV R2,A   
+0470: 8A 48   ORL P2,#$48
+0472: FA      MOV A,R2   
+0473: 17      INC A      
+0474: C6 7A   JZ $047A   
+0476: 9A F7   ANL P2,#$F7
+0478: 84 5E   JMP $045E
+047A: C9      DEC R1
+047B: F9      MOV A,R1
+047C: 96 5B   JNZ $045B  
+047E: 8A 48   ORL P2,#$48
+0480: 23 02   MOV A,#$02 
+0482: 83      RET        
+0483: 56 6F   JT1 $046F  
+                         
+
+>>>>>>>>> SUB Receive serial transmission from AUX
+Identical to KBD, result in R4, error code in A. 
+                           
+0485: BA 09   MOV R2,#$09  
+0487: BB 00   MOV R3,#$00  
+0489: 55      STRT T       
+048A: 46 8A   JNT1 $048A   
+048C: FC      MOV A,R4     
+048D: 67      RRC A
+048E: AC      MOV R4,A
+048F: 56 8F   JT1 $048F    
+0491: 97      CLR C
+0492: 09      IN A,P1      
+0493: 37      CPL A
+0494: 32 98   JB1 $0498    
+0496: A7      CPL C        
+0497: 1B      INC R3       
+0498: EA 8A   DJNZ R2,$048A
+049A: 46 9A   JNT1 $049A   
+049C: 84 9E   JMP $049E    
+049E: 56 9E   JT1 $049E    
+04A0: 65      STOP TCNT    
+04A1: 00      NOP          
+04A2: 8A 48   ORL P2,#$48  
+04A4: FB      MOV A,R3     
+04A5: 12 AA   JB0 $04AA    
+04A7: 23 01   MOV A,#$01 
+04A9: 83      RET          
+04AA: 27      CLR A        
+04AB: 83      RET
+
+04AC: 00 .. ..
+  
+
+
+****************************************
+**                                    **
+** PAGE-5: Host command processing    **
+**                                    **
+****************************************
+
+>>>>>>>>> SUB used during RESET
+0500: A3      MOVP A,@A
+0501: 83      RET
+
+>>>>>>>>> JMP
+                               ; Command processing: Host written 0x64
+0502: 22      IN A,DBB         ; read in and dispatch
+0503: F2 09   JB7 $0509        ; 
+0505: D2 12   JB6 $0512
+0507: A4 0D   JMP $050D        
+
+0509: D2 79   JB6 $0579
+050B: A4 2C   JMP $052C
+
+050D: 74 E0   CALL $03E0       ; 00xx xxxx Command: Read RAM (00..3F -> 20..3F)
+050F: F0      MOV A,@R0        ; read RAM     
+0510: A4 ED   JMP $05ED        ; --> send to Host 
+
+0512: 74 E0   CALL $03E0       ; --> 01xx xxxx Command: Write RAM (40..7F -> 00..3F -> 20..3F)
+0514: D6 14   JNIBF $0514      ; ..wait next byte from Host.. 
+0516: 76 02   JF1 $0502        ; Command? again
+0518: D3 20   XRL A,#$20       ; A=20h?
+051A: C6 20   JZ $0520
+051C: 22      IN A,DBB         ; Host not writing $20: read in value
+051D: A0      MOV @R0,A        ; write RAM
+051E: A4 25   JMP $0525        ; --> back to Main Loop
+
+0520: 22      IN A,DBB         ; Host writes $20 is a little special: bit2 written is mirrored in CPU flag F0
+0521: A0      MOV @R0,A        ; Write RAM[20h]
+0522: 52 27   JB2 $0527        ; Hosts sets $20_2? (Note: F0-bit is never used by the firmware)
+0524: 85      CLR F0           ; no, Host clears $20_2: clear F0 CPU flag
+0525: 64 88   JMP $0388        ; --> back to Main Loop
+0527: B6 25   JF0 $0525        ; yes, Host sets $20_2: already set? --> back to Main Loop
+0529: 95      CPL F0           ; Host sets $20_2 but it is cleared: set F0
+052A: 64 88   JMP $0388        ; --> back to Main Loop
+
+052C: B8 20   MOV R0,#$20      ; 10xx xxxx Command
+052E: 03 5C   ADD A,#$5C
+0530: 96 34   JNZ $0534
+0532: 24 99   JMP $0199        ; Command A4: Password Installed Test, then --> Reply to Host 
+
+0534: 07      DEC A
+0535: 96 39   JNZ $0539
+0537: 24 83   JMP $0183        ; Command A5: "Load Security: bytes written to Data port will be read until a null (0) is found" then --> back to Main Loop
+
+0539: 07      DEC A
+053A: 96 3E   JNZ $053E
+053C: 24 4C   JMP $014C        ; Command A6: Enable Security then --> back to Main Loop OR enter Security Main Loop
+
+053E: 07      DEC A
+053F: 96 46   JNZ $0546
+0541: F0      MOV A,@R0        ; Command A7: Disable second PS/2 port
+0542: 43 20   ORL A,#$20       ; set bit5 of $20
+0544: A4 76   JMP $0576        ; RET
+                              
+0546: 07      DEC A           
+0547: 96 4E   JNZ $054E       
+0549: F0      MOV A,@R0        ; Command A8: Enable second PS/2 port
+054A: 53 DF   ANL A,#$DF       ; clear bit5 of $20
+054C: A4 76   JMP $0576        ; RET
+                              
+054E: 07      DEC A           
+054F: 96 55   JNZ $0555       
+0551: F4 67   CALL $0767       ; Command A9: Test second PS/2 port
+0553: A4 EE   JMP $05EE        ; Result in R4 -> send to Host
+                              
+0555: 07      DEC A           
+0556: 96 60   JNZ $0560       
+0558: 89 FF   ORL P1,#$FF      ; Command AA: Test PS/2 Controller (0x55=Test passed, 0xFC=Test failed)
+055A: 23 4B   MOV A,#$4B       ; init port-1 (write all '1' for input) and port-2 (pull KBD and AUX CLK down. Also A20 and clr RES)
+055C: 3A      OUTL P2,A       
+055D: C5      SEL RB0          ; select RAM BANK 0
+055E: 04 66   JMP $0066        ; --> as if AA arrived after RESET: Soft Reset the whole 8042
+                              
+0560: 07      DEC A           
+0561: 96 67   JNZ $0567       
+0563: F4 34   CALL $0734       ; Command AB: Test first PS/2 port (result in R4)
+0565: A4 EE   JMP $05EE        ; --> send R4 to Host 
+
+0567: 07      DEC A
+0568: 07      DEC A
+0569: 96 70   JNZ $0570
+056B: F0      MOV A,@R0        ; Command AD: Disable first PS/2 port
+056C: 43 10   ORL A,#$10       ; set $20 bit4
+056E: A4 76   JMP $0576        ; --> back to Main Loop
+                               
+0570: 07      DEC A            
+0571: 96 25   JNZ $0525        ; --> back to Main Loop      
+0573: F0      MOV A,@R0        ; Command AE: Enable first PS/2 port
+0574: 53 EF   ANL A,#$EF       ; clear $20 bit4
+                               
+0576: A0      MOV @R0,A        
+0577: A4 25   JMP $0525        ; --> back to Main Loop
+
+
+>>>>>>>>> 11xx xxxx Command
+
+0579: B2 99   JB5 $0599
+057B: 92 BB   JB4 $05BB
+
+057D: D3 C0   XRL A,#$C0       ; 1100 xxxx Command
+057F: 96 84   JNZ $0584
+0581: 09      IN A,P1          ; Command C0: read P1
+0582: A4 ED   JMP $05ED        ; --> send to Host 
+
+0584: D3 02   XRL A,#$02       ; 
+0586: 96 8E   JNZ $058E
+
+0588: 09      IN A,P1          ; Command C2: poll P1_4-7 and move to STS high nibble 
+0589: 90      MOV STS,A        ; wait until Host writes something
+058A: D6 88   JNIBF $0588      ; IB empty? loop..
+058C: A4 25   JMP $0525        ; byte from Host: --> back to Main Loop with IBF set 
+
+058E: D3 01   XRL A,#$01
+0590: 96 25   JNZ $0525
+0592: 09      IN A,P1          ; Command C1: poll P1_0-3 and move to STS HI nibble 
+0593: 47      SWAP A
+0594: 90      MOV STS,A
+0595: D6 92   JNIBF $0592      ; loop..
+0597: A4 25   JMP $0525        ; --> back to Main Loop with IBF set 
+
+>>>>>>>>> 111x xxxx Command
+
+0599: 92 A9   JB4 $05A9
+059B: D3 E0   XRL A,#$E0       ; 1110 xxxx Command
+059D: 96 25   JNZ $0525
+059F: 26 A3   JNT0 $05A3       ; Command E0: sample T0 and T1 (KBD/AUX CLK)
+05A1: 43 01   ORL A,#$01       ; KBD CLK high: set bit 0
+05A3: 46 ED   JNT1 $05ED       ; either set: --> send 00 to Host
+05A5: 43 02   ORL A,#$02       ; AUX CLK high: set bit 1
+05A7: A4 ED   JMP $05ED        ; send to Host 0,1,2 or 3 (0 0 0 0 0 0 T1 T0)
+
+>>>>>>>>> 1111 xxxx Command: Pulse all P2 outputs except changing IRQ-bits
+
+05A9: AA      MOV R2,A         ; R2 =  A
+05AA: 37      CPL A
+05AB: A9      MOV R1,A         ; R1 = ~A
+05AC: B8 20   MOV R0,#$20
+05AE: F0      MOV A,@R0        ; read $20 
+05AF: 47      SWAP A
+05B0: 53 30   ANL A,#$30       ; IRQ EN in high (we don't touch these bits in P2)
+05B2: AB      MOV R3,A         ; save in R3
+05B3: 0A      IN A,P2          ; read P2 
+05B4: 4B      ORL A,R3         ; or with IRQ 
+05B5: 5A      ANL A,R2         ; clear low-nibble
+05B6: 3A      OUTL P2,A        ; 
+05B7: 49      ORL A,R1
+05B8: 3A      OUTL P2,A        ; complement; write again 
+05B9: A4 25   JMP $0525        ; --> back to Main Loop
+
+>>>>>>>>> 1101 xxxx Command
+
+05BB: D3 D0   XRL A,#$D0
+05BD: 96 C2   JNZ $05C2
+05BF: 0A      IN A,P2          ; D0 Command: Read P2  
+05C0: A4 ED   JMP $05ED        ; reply to Host
+
+05C2: 07      DEC A
+05C3: 96 CD   JNZ $05CD
+05C5: D6 C5   JNIBF $05C5      ; D1 Command: Write P2
+05C7: 76 02   JF1 $0502        ; ..wait for input from Host.. command? --> start again
+05C9: 22      IN A,DBB         ; read in 
+05CA: 3A      OUTL P2,A        ; output to P2
+05CB: A4 25   JMP $0525        ; --> back to Main Loop
+
+05CD: 07      DEC A
+05CE: 96 D7   JNZ $05D7
+05D0: D6 D0   JNIBF $05D0      ; D2 Command (KBD loopback): send byte back to Host as if received from KBD
+05D2: 76 02   JF1 $0502        ; command? --> start again
+05D4: 22      IN A,DBB         ; read from Host..
+05D5: A4 ED   JMP $05ED        ; ..send to Host
+
+05D7: 07      DEC A
+05D8: 96 E4   JNZ $05E4
+05DA: D6 DA   JNIBF $05DA      ; D3 Command (AUX loopback): send byte back to Host as if received from AUX
+05DC: 76 02   JF1 $0502        ; command? --> start again
+05DE: 22      IN A,DBB         ; read from Host..
+05DF: AC      MOV R4,A
+05E0: B9 00   MOV R1,#$00
+05E2: E4 1A   JMP $071A        ; --> Send to Host from AUX + IRQ12.. ---> then back to Main Loop 
+
+05E4: 07      DEC A
+05E5: 96 25   JNZ $0525        ; --> no more Commands supported: back to Main Loop
+
+05E7: D6 E7   JNIBF $05E7      ; D4 Command: poll Host to write next byte
+05E9: 76 02   JF1 $0502        ; command? --> start again
+05EB: 44 7E   JMP $027E        ; --> send byte to AUX 
+
+05ED: AC      MOV R4,A         ; end Command processing: result in R4
+05EE: B9 00   MOV R1,#$00      ; no error in STS
+05F0: E4 00   JMP $0700        ; --> Send R4 to Host from KBD + IRQ.. then --> back to Main Loop
+
+
+05F2: 00 .. .. .. 
+
+
+
+***************************************************
+**                                               **
+** PAGE-6: Receiving data from device protocol   **
+** Either from Security- or 'normal' Main Loop   **
+** when device pulled CLK stable low             **
+** Then replies to Host                          **
+** And back to Main Loop                         **
+***************************************************
+
+Identical for KBD and AUX except the extra XLAT routine for KBD and in Security Mode. 
+The two flowcharts side by side: 
+
+    0602: Receive from KBD                                                  0670: Receive from AUX         
+           |                                                                       |
+    0430: Receive transmission from KBD                                     0485: Receive transmission from AUX                             
+        into R4                                                                 into R4                                                 
+           |                                                                       |                                                    
+        time-out? ------------------>------------------------+                  time-out? ------------------>------------------------+  
+           |                                                 |                     |                                                 |  
+        parity err? -------->-----+                          |                  parity err? -------->-----+                          |  
+           |                      |                          |                     |                      |                          |  
+           |          +----> loop $21 times                  |                     |          +----> loop $21 times                  |  
+           |          |           |                          |                     |          |           |                          |  
+           |          |        $21=00? -------->----+        |                     |          |        $21=00? -------->----+        |  
+           |          |           |                 |        |                     |          |           |                 |        |  
+           |          |        inc $23              |        |                     |          |        inc $31              |        |  
+           |          |           |                 |        |                     |          |           |                 |        |  
+           |          |  022C: Transmit to KBD      |        |                     |          |  02A8: Transmit to AUX      |        |  
+           |          |         FE=Resend           |        |                     |          |         FE=Resend           |        |  
+           |          |           |                 |        |                     |          |           |                 |        |  
+           |          |        time-out? ------>----+        |                     |          |        time-out? ------>----+        |  
+           |          |           |                 |        |                     |          |           |                 |        |  
+           |          |  0402: Receive response     |        |                     |          |  0457: Receive response     |        |  
+           |          |        from KBD into R4     |        |                     |          |        from AUX into R4     |        |  
+           |          |           |                 |        |                     |          |           |                 |        |  
+           |          +---<--- parity err?          |        |                     |          +---<--- parity err?          |        |  
+           |          |           |                 |        |                     |          |           |                 |        |  
+           |          |        time-out? ------>----+        |                     |          |        time-out? ------>----+        |  
+           |          |           |                 |        |                     |          |           |                 |        |  
+           |          +---<--- NACK=FEh?            |        |                     |          +---<--- NACK=FEh?            |        |  
+           |                      |                 |        |                     |                      |                 |        |  
+           |                      |               R4=00    R4=00                   |                      |               R4=00    R4=00
+         STS=00 <-----------------+              STS=80   STS=40                 STS=00 <-----------------+              STS=80   STS=40
+           |                                        |        |                     |                                        |        |  
+           +------------<---------------------------+---<----+                     +------------<---------------------------+---<----+  
+           |                                                                       |                                                    
+           |                                                                       |                                                    
+        SECURITY? ----------------> 0102: Check keystroke                       SECURITY? --> SECURITY MAIN
+           |                                     |                                 |                                                    
+         XLAT? --------+                    SECURITY MAIN                          |
+           |           |                                                           |
+           |     R4 = Translate to Set-1                                           |
+           |           |                                                           |
+           +-----------+                                                           |
+           |                                                                       |                                                    
+    0700: Send R4 to Host from KBD                                          071A: Send R4 to Host from AUX
+        and set STS                                                             and set STS                                              
+
+
+>>>>>>>>> SUB used during RESET
+0600: A3      MOVP A,@A
+0601: 83      RET
+
+
+**************************************
+**    JMP: Receive from KBD         **
+**************************************
+
+  ; From Main Loop or Security Main Loop: KBD pulled CLK stable low. Normally: 
+  ; - receive transmission 
+  ; - and send byte to Host 
+  ; 
+  ; On Parity error: 
+  ; - by default 8042 retries receiving data once ($21=01) by sending the FEh=Resend command 
+  ; - counts this event in $23/$31 for KBD/AUX. 
+  ; - if $21 is zero, no re-try, send 00 to Host with STS=80, parity error. 
+  ; 
+  ; On time-out error: 
+  ; - sends 00 to Host with STS=40, time-out error. 
+  ; 
+  ; When SECURITY BIT set:
+  ; - KBD: Check keystrokes using the XLAT TABLE
+  ; - AUX: do nothing 
+
+0602: 94 30   CALL $0430       ; ---> Receive PS/2 data from device (result in R4, error code in A)                       
+0604: 12 0A   JB0 $060A        ; parity error?                                                                            
+0606: 32 30   JB1 $0630        ; time-out error?                                                                          
+0608: C4 36   JMP $0636        ; ok ->                                                                                       
+                                                                                                                          
+060A: B8 21   MOV R0,#$21      ; parity error:                                                                            
+060C: F0      MOV A,@R0        ; read $21 Resend-count                                                                    
+060D: C6 2C   JZ $062C         ; $21 is zero? No resend, set parity-error in STS and send 00 to Host                      
+060F: AD      MOV R5,A         ; $21 is non-zero (RESET sets to '01'): enter Resend loop (save A=$21 to R5 loop count var)
+                                                                                                                          
+0610: B8 23   MOV R0,#$23      ; ------------- Resend FEh loop and counting this in $23 --------------+                   
+0612: F0      MOV A,@R0                         (By default retried once, $21 = 01)                   |                   
+0613: 17      INC A                                                                                   |                   
+0614: C6 17   JZ $0617         ; inc $23 until FFh max                                                |                   
+0616: A0      MOV @R0,A                                                                               |                   
+0617: BC FE   MOV R4,#$FE      ; FEh = Resend                                                         |                   
+0619: 54 2C   CALL $022C       ; ---> transmit to device (this command is replied with last byte sent or NACK=FEh)            
+061B: 32 2C   JB1 $062C        ; time-out? --> send 00 back to Host with STS 80h parity error         |                   
+061D: B9 29   MOV R1,#$29      ; no time-out: loop-count=29h (we give a little more time as usual 0B to device to respond)                    
+061F: 94 02   CALL $0402       ; ---> Call Wait and Receive response byte from device after sending Command         
+0621: 12 2A   JB0 $062A        ; parity-err again? loop R5-times                                      |                   
+0623: 32 2C   JB1 $062C        ; time-err? --> send 00 back to Host with STS 80h parity error         |                   
+0625: FC      MOV A,R4         ; OK: no error in receiving response: check response:                  |                   
+0626: D3 FE   XRL A,#$FE       ; got NACK=FEh? loop R5-times                                          |                   
+0628: 96 36   JNZ $0636        ; not NACK: accept as successfull --> send to Host                     |                                
+062A: ED 10   DJNZ R5,$0610    ; loop R5-times   -----------------------------------------------------+                   
+                                                                                                                          
+062C: B9 80   MOV R1,#$80      ; set STS 80h parity error                                                                 
+062E: C4 32   JMP $0632        ; --> send 00 back to Host                                                                 
+                                                                                                                          
+0630: B9 40   MOV R1,#$40      ; time-out error: set STS 40h 
+0632: BC 00   MOV R4,#$00      ; --> send 00 to Host                                                                 
+0634: C4 38   JMP $0638                                                                                                   
+                                                                                                                                                                                                                     
+0636: B9 00   MOV R1,#$00      ; OK: STS=00 
+0638: B8 40   MOV R0,#$40      ; check PASSWORD SECURITY BIT: 
+063A: F0      MOV A,@R0
+063B: 37      CPL A
+063C: 12 40   JB0 $0640        ; ---> $40 bit0=0: go further, send Set-2 (pass-through) or Set-1 (XLAT ON) to host 
+063E: 24 02   JMP $0102        ; ---> $40 bit0=1: SECURITY BIT set: Check keystrokes using the XLAT TABLE
+
+
+>>>>>>>>> Scan Code Processing (raw scancode in R5): check XLAT and send Set-1 or Set-2 to Host 
+
+00..7F   -> XLAT
+83 -> 02 -> XLAT
+84 -> 7F -> XLAT
+F0: breakcode, set bit7
+E0/E1: send withaout XLAT, as is
+
+                               ; We get here from above with received byte from KBD in R4
+0640: B8 20   MOV R0,#$20      ; check XLAT: $20_6
+0642: F0      MOV A,@R0
+0643: 37      CPL A
+0644: D2 6E   JB6 $066E        ; $20 bit6 cleared XLAT zero ---> reply R4 to Host as is (XLAT off, pass-through, Set-2)
+
+0646: FC      MOV A,R4         ; XLAT ON, $20 bit6 set: check kb data byte
+0647: D3 83   XRL A,#$83       ; KBD sends (00..7F) or 83, 84, F0 (84-key) and E0, E1 (101/102-key)
+0649: 96 4F   JNZ $064F        ; 
+064B: BC 02   MOV R4,#$02      ; 83h: change it 'back' to 02 (84-key AT-keyboard translates 02 to 83.. KEY_F7, interesting)
+064D: C4 56   JMP $0656        ; this is no break-code: change to 02h ( XLAT TABLE[02]=41h indeed, the Set-1 make code for F7-key )
+
+064F: FC      MOV A,R4         ; 84h? (Funny guys at IBM: 84 hex was the new scancode added for the 84-key AT keyboard: SysRq)
+0650: D3 84   XRL A,#$84       ; check for 84h
+0652: 96 56   JNZ $0656        : not 84h
+0654: BC 7F   MOV R4,#$7F      ; 84h: change it again 'back' to 7F (84-key AT-keyboard translates 7F to 84.. KEY_SysRq) 84h: translate to 7Fh: XLAT TABLE[7Fh]=54h = 84 decimal, will be sent as Set-1
+
+0656: FC      MOV A,R4         ; not 83,84:
+0657: F2 64   JB7 $0664        ; bit7 set?  Can be E0/E1 or F0: check for F0
+
+0659: E3      MOVP3 A,@A       ; bit7=0 (make code) 
+065A: AC      MOV R4,A         ; replace code in R4 from XLAT TABLE ("translate to Set-1")
+065B: B8 2D   MOV R0,#$2D
+065D: F0      MOV A,@R0        ; read $2D (break-code bit)
+065E: 4C      ORL A,R4         ; or with R4: might set bit7 (Set-1 break codes)
+065F: AC      MOV R4,A         ; R4 now is the translated code (Set-1, make- or break code)
+0660: 27      CLR A
+0661: A0      MOV @R0,A        ; clear $2D break-code bit
+0662: C4 6E   JMP $066E        ; ---> reply to Host
+
+0664: D3 F0   XRL A,#$F0       ; bit7=1 (can be Set-2 break code F0h or E0-sequence: only save 'break' to $2D=80h and back to Main Loop)
+0666: 96 6E   JNZ $066E        ; not F0h: reply to Host (this sends E0h as is, see Set-1)
+
+0668: B8 2D   MOV R0,#$2D      ; F0h: set break code bit in $2D and back to Main Loop
+066A: B0 80   MOV @R0,#$80     ;
+066C: 64 88   JMP $0388        ; ---> back to Main Loop
+066E: E4 00   JMP $0700        ; ---> Send R4 to Host from KBD + IRQ.. then ---> back to Main Loop
+
+
+**************************************
+**    JMP: Receive from AUX         **
+**************************************
+Almost identical as KBD to the end
+
+0670: 94 85   CALL $0485  
+0672: 12 78   JB0 $0678   
+0674: 32 9E   JB1 $069E   
+0676: C4 A4   JMP $06A4   
+
+0678: B8 21   MOV R0,#$21 
+067A: F0      MOV A,@R0   
+067B: C6 9A   JZ $069A    
+067D: AD      MOV R5,A    
+
+067E: B8 31   MOV R0,#$31 
+0680: F0      MOV A,@R0   
+0681: 17      INC A       
+0682: C6 85   JZ $0685    
+0684: A0      MOV @R0,A   
+0685: BC FE   MOV R4,#$FE 
+0687: 54 A8   CALL $02A8  
+0689: 32 9A   JB1 $069A   
+068B: B9 29   MOV R1,#$29 
+068D: 94 57   CALL $0457  
+068F: 12 98   JB0 $0698   
+0691: 32 9A   JB1 $069A   
+0693: FC      MOV A,R4    
+0694: D3 FE   XRL A,#$FE  
+0696: 96 A4   JNZ $06A4   
+0698: ED 7E   DJNZ R5,$067
+
+069A: B9 80   MOV R1,#$80 
+069C: C4 A0   JMP $06A0   
+
+069E: B9 40   MOV R1,#$40 
+06A0: BC 00   MOV R4,#$00 
+06A2: C4 A6   JMP $06A6
+
+06A4: B9 00   MOV R1,#$00 
+06A6: B8 40   MOV R0,#$40 
+06A8: F0      MOV A,@R0
+06A9: 37      CPL A
+06AA: 12 AE   JB0 $06AE
+06AC: 24 6F   JMP $016F        ; ---> $40 bit0=1: SECURITY BIT set: do nothing, go back to Security Main Loop
+06AE: E4 1A   JMP $071A        ; ---> $40 bit0=0: Send R4 to host from AUX + IRQ12.. ---> then back to Main Loop
+
+06B0: 00 .. ..
+
+
+
+*************************************************************************
+**                                                                     **
+** PAGE-7: Host communication                                          **
+** Two identical subroutines for sending R4 to Host from KBD and AUX   **
+** Two identical subroutines for Test PS/2 port Command                **
+**                                                                     **
+*************************************************************************
+
+R1: Status to write into STS HI (00, 80, C0, 40 error-status)
+or-ed with 10 (KBD), 30 (AUX)
+
+>>>>>>>>> JMP Send to Host from KBD /w IRQ1
+
+  ; R4: writes into Output Buffer. If KBD IRQ is enabled in $20 STATUS, asserts IRQ1 on Port-2. 
+  ; R1: received status bits (00, 40, 80, C0) or-ed with 10 for KBD --> then writes STS. 
+
+0700: B8 20   MOV R0,#$20      ; read RAM $20
+0702: F0      MOV A,@R0
+0703: 12 0D   JB0 $070D        ; IRQ1 EN?
+
+0705: F9      MOV A,R1         ; IRQ1 DIS: 
+0706: 43 10   ORL A,#$10
+0708: 90      MOV STS,A        ; STS = R1 | 10h (set 8042 placed data in OB from KBD)
+0709: FC      MOV A,R4
+070A: 02      OUT DBB,A
+070B: 64 88   JMP $0388        ; ---> back to Main Loop
+
+070D: F9      MOV A,R1         ; IRQ1 EN:
+070E: 43 10   ORL A,#$10
+0710: 90      MOV STS,A        ; STS = R1 | 10h 
+0711: FC      MOV A,R4
+0712: 02      OUT DBB,A
+0713: 8A 10   ORL P2,#$10      ; assert IRQ1
+0715: 00      NOP              ; wait a little..
+0716: 9A CF   ANL P2,#$CF      ; clear IRQ1 and IRQ12
+0718: 64 88   JMP $0388        ; ---> Main Loop
+
+
+>>>>>>>>> JMP Send to Host from AUX /w IRQ12
+
+  ; R4: writes into Output Buffer. If AUX IRQ is enabled in $20 STATUS, asserts IRQ12 on Port-2. 
+  ; R1: received status bits (00, 40, 80, C0) or-ed with 30 for AUX --> then writes STS. 
+  
+071A: B8 20   MOV R0,#$20
+071C: F0      MOV A,@R0
+071D: 32 27   JB1 $0727        ; IRQ12 EN?
+
+071F: F9      MOV A,R1         ; IRQ12 DIS: (just send AUX byte to Host and go to Main Loop)
+0720: 43 30   ORL A,#$30       ; STS = R1 | 30h (set 8042 placed data in OB from AUX)
+0722: 90      MOV STS,A
+0723: FC      MOV A,R4
+0724: 02      OUT DBB,A        ; send R4 to Host 
+0725: 64 88   JMP $0388        ; ---> Main Loop 
+
+0727: F9      MOV A,R1         ; IRQ12 EN: 
+0728: 43 30   ORL A,#$30       ; STS = R1 | 30h
+072A: 90      MOV STS,A
+072B: FC      MOV A,R4
+072C: 02      OUT DBB,A        ; send R4 to Host 
+072D: 8A 20   ORL P2,#$20      ; assert IRQ12
+072F: 00      NOP              ; wait a little..
+0730: 9A CF   ANL P2,#$CF      ; clear IRQ12 and IRQ1
+0732: 64 88   JMP $0388        ; ---> Main Loop 
+
+
+
+>>>>>>>>> SUB: Command AB: Test first PS/2 port 
+Returns in R4: 0x00=Test passed, 0x01=Clock line stuck low, 0x02=Clock line stuck high, 0x03=Data line stuck low, 0x04=Data line stuck high (http://www.flingos.co.uk/docs/reference/PS2-Keyboards/)
+
+0734: 9A BF   ANL P2,#$BF      ; release KBD CLK: pull high
+0736: 9A 7F   ANL P2,#$7F      ; release KBD DATA: pull high
+
+0738: B8 00   MOV R0,#$00      ; poll KBD CLK 256 times
+073A: 36 42   JT0 $0742        ; high? ok, stays high, check further
+073C: E8 3A   DJNZ R0,$073A    ; still low? loop
+
+073E: BC 01   MOV R4,#$01
+0740: E4 66   JMP $0766        ; RET 01 in R4: sorry, 8042 released CLK but it's low (CLK held low by device?)
+
+0742: 8A 40   ORL P2,#$40      ; KBD CLK high: pull it low
+0744: E4 46   JMP $0746        ; wait a little
+0746: 26 4E   JNT0 $074E       ; stays low? ok, go further
+0748: 9A BF   ANL P2,#$BF      ; oops, no, still high
+074A: BC 02   MOV R4,#$02
+074C: E4 66   JMP $0766        ; RET 02 in R4 (8042 couldn't pull CLK low)
+
+074E: B8 00   MOV R0,#$00      ; 8042 succeded pulling KBD CLK down
+0750: 09      IN A,P1          ; now sample KBD DATA 256 times: see if it's released (high, idle)
+0751: 12 59   JB0 $0759        ; high? ok, further 
+0753: E8 50   DJNZ R0,$0750    ; still low.. loop and wait 
+
+0755: BC 03   MOV R4,#$03      ; 8042 couldn't pull DATA low
+0757: E4 66   JMP $0766        ; RET 03 in R4
+
+0759: 8A 80   ORL P2,#$80      ; KBD DATA high: pull KBD DATA low
+075B: 00      NOP              ; wait a little
+075C: BC 00   MOV R4,#$00      ; R4=00 OK
+075E: 09      IN A,P1          ; sample KBD DATA..
+075F: 37      CPL A
+0760: 12 64   JB0 $0764
+0762: BC 04   MOV R4,#$04      ; KBD DATA still high: couldn't pull it low: RET 04 in R4
+0764: 9A 7F   ANL P2,#$7F      ; KBD DATA = low: OK, all went fine, release DATA and RET 00 in R4
+0766: 83      RET
+
+>>>>>>>>> SUB Command A9: Test second PS/2 port (identical code as KBD)
+
+0x00=Test passed, 0x01=Clock line stuck low, 0x02=Clock line stuck high, 0x03=Data line stuck low, 0x04=Data line stuck high (http://www.flingos.co.uk/docs/reference/PS2-Keyboards/)
+
+0767: 9A F7   ANL P2,#$F7      ; release AUX CLK by pulling up
+0769: 9A FB   ANL P2,#$FB      ; release AUX DATA by pulling up
+
+076B: B8 00   MOV R0,#$00      ; sample AUX CLK 256-times for low
+076D: 56 75   JT1 $0775        ; high? exit
+076F: E8 6D   DJNZ R0,$076D    ; again
+
+0771: BC 01   MOV R4,#$01      ; nope, mouse is holding CLK down (stuck?)
+0773: E4 99   JMP $0799        ; RET 01
+
+0775: 8A 08   ORL P2,#$08      ; AUX CLK high: pull it low
+0777: E4 79   JMP $0779        ; wait a little
+0779: 46 81   JNT1 $0781       ; stays low?
+
+077B: 9A F7   ANL P2,#$F7      ; no, 8042 cannot pull it low
+077D: BC 02   MOV R4,#$02      ; release AUX CLK by pulling up
+077F: E4 99   JMP $0799        ; RET 02
+
+0781: B8 00   MOV R0,#$00      ; AUX CLK pulled low by 8042
+0783: 09      IN A,P1          ; sample AUX DATA 256 times
+0784: 32 8C   JB1 $078C        ; high? exit
+0786: E8 83   DJNZ R0,$0783    ; loop
+
+0788: BC 03   MOV R4,#$03      ; AUX DATA low
+078A: E4 99   JMP $0799        ; RET 03
+
+078C: 8A 04   ORL P2,#$04      ; AUX DATA high: pull it low
+078E: 00      NOP
+078F: BC 00   MOV R4,#$00      ; 
+0791: 09      IN A,P1          ; sample AUX DATA 
+0792: 37      CPL A
+0793: 32 97   JB1 $0797        ; stays low?
+0795: BC 04   MOV R4,#$04      ; no, pulled down, RET 04
+0797: 9A FB   ANL P2,#$FB      ; low: release AUX DATA by pulling up
+0799: 83      RET              ; RET 00
+
+
+
+
+>>>>>>>>> AFTER RESET AND SANITY CHECK
+
+After all 128 bytes RAM OK and AA command received:
+
+Reads all bytes of all 8 Pages of ROM and computes "something"
+Checks the result in R6/R7 for zero (OK). 
+Got also zero in my little UPI simulator, but needs more investigation.. 
+
+R6/R7= FFFFh
+checksum? into R6/R7
+Then checks R6/R7 for zero -> OK
+R4/R5: scratch
+
+079A: 23 40   MOV A,#$40       ; set status (40h = "RAM OK, testing ROM..") 
+079C: 90      MOV STS,A
+079D: 23 FF   MOV A,#$FF
+079F: AE      MOV R6,A         ; R6 = FFh
+07A0: AF      MOV R7,A         ; R7 = FFh
+07A1: BA 08   MOV R2,#$08      ; R2 = 08h   for(Page) 8,7,..
+07A3: B8 00   MOV R0,#$00      ; R0 = 00h   for(byte) -> A = -R0 0,1,2,...
+
+07A5: FA      MOV A,R2         ; ------------------------------------+
+07A6: AB      MOV R3,A         ; R2 -> R3 PageNr                     |
+07A7: F8      MOV A,R0                                               |
+07A8: 37      CPL A                                                  |
+07A9: 17      INC A            ; A = -R0 ("NEG A")                   |
+                               ; switch(PageNr)                      |
+07AA: EB AD   DJNZ R3,$07AD    ;   case: 7                           |
+07AC: A3      MOVP A,@A        ;     this page                       |
+07AD: EB B1   DJNZ R3,$07B1    ;   case: 6                           |
+07AF: D4 00   CALL $0600       ;   ---> MOVP A,@A  RET               |
+07B1: EB B5   DJNZ R3,$07B5    ;   case: 5                           |
+07B3: B4 00   CALL $0500       ;   ---> MOVP A,@A  RET               |
+07B5: EB B9   DJNZ R3,$07B9    ;   case: 4                           |
+07B7: 94 00   CALL $0400       ;   ---> MOVP A,@A  RET               |
+07B9: EB BC   DJNZ R3,$07BC    ;   case: 3                           |
+07BB: E3      MOVP3 A,@A                                             |
+07BC: EB C0   DJNZ R3,$07C0    ;   case: 2                           |
+07BE: 54 00   CALL $0200       ;   ---> MOVP A,@A  RET               |
+07C0: EB C4   DJNZ R3,$07C4    ;   case: 1                           |
+07C2: 34 00   CALL $0100       ;   ---> MOVP A,@A  RET               |
+07C4: EB C8   DJNZ R3,$07C8    ;   case: 0                           |
+07C6: 14 05   CALL $0005       ;   ---> MOVP A,@A  RET               |
+                                                                     |
+07C8: DE      XRL A,R6         ; hell knows what this computes..     |
+07C9: AD      MOV R5,A         ; into R6/R7                          |
+07CA: 47      SWAP A           ;                                     |
+07CB: AC      MOV R4,A         ;    T O D O                          |
+07CC: DD      XRL A,R5         ;                                     |
+07CD: AE      MOV R6,A                                               |
+07CE: E7      RL A                                                   |
+07CF: 53 E0   ANL A,#$E0                                             |
+07D1: DD      XRL A,R5                                               |
+07D2: 2E      XCH A,R6                                               |
+07D3: F7      RLC A                                                  |
+07D4: 47      SWAP A                                                 |
+07D5: 67      RRC A                                                  |
+07D6: 67      RRC A                                                  |
+07D7: E7      RL A                                                   |
+07D8: 53 F1   ANL A,#$F1                                             |
+07DA: 2C      XCH A,R4                                               |
+07DB: 53 0F   ANL A,#$0F                                             |
+07DD: AD      MOV R5,A                                               |
+07DE: E7      RL A                                                   |
+07DF: DC      XRL A,R4                                               |
+07E0: DF      XRL A,R7                                               |
+07E1: 2E      XCH A,R6                                               |
+07E2: DD      XRL A,R5                                               |
+07E3: AF      MOV R7,A                                               |
+07E4: E8 A5   DJNZ R0,$07A5    ; ------------------------------------+
+07E6: EA A5   DJNZ R2,$07A5    ; ------------------------------------+
+
+07E8: FE      MOV A,R6         ; test R6/R7 for zero
+07E9: 96 F0   JNZ $07F0
+07EB: FF      MOV A,R7
+07EC: 96 F0   JNZ $07F0
+07EE: 04 B4   JMP $00B4        ; --> zero, OK: go Test Timer Interrupt
+07F0: 04 58   JMP $0058        ; --> non-zero: ERR, back to Wait for Host AA command loop
+
+07F2: 00      NOP
+07F3: 00      NOP
+07F4: 00      NOP
+07F5: 00      NOP
+07F6: 00      NOP
+07F7: 00      NOP
+07F8: 00      NOP
+07F9: 00      NOP
+07FA: 00      NOP
+07FB: 00      NOP
+07FC: 00      NOP
+07FD: 00      NOP
+
+07FE: 87 AF                    ; I guess these bytes are put here 
+                               ; for proper checksum of the whole ROM
+
+
+>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>   END OF ROM  <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
