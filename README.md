@@ -5,13 +5,9 @@ A long, long time ago I analyzed and commented IBM's 8042 AT controller ROM to s
 This table shows some features of these keyboards, roughly with IBM PC models in line and links to the four commented disassemblies: 
 
 
-
-
-
-
-| IBM Keyboard   | Capacitive |  Schematics<br>IBM TechRef |  Controller/<br>1K ROM dump | SENSE<br>AMPLIFIER | Keyboard<br>Matrix = N  |  PC Controller/<br>2K ROM dump    |
-|----------------|------------|--------------|--------------|------------|----------------|-----------------|
-| 83-Key<br>Type-1<br>Model F |  Yes |  Yes |   i8048<br>none     |  4-sense<br>5119699<br>IBM 14 |  24 x 4 =  96  |    BIOS+LS322<br>N/A<br><br>IBM PC 1981    |
-| 83-Key<br>Type-2<br>Model F  |    Yes     |     Yes      |   i8048<br><a href="8048_XT_INTERN.TEXT">4584751</a>     |  8-sense<br>8273565<br>IBM 9314   |  12 x 8 =  96  |    BIOS+LS322<br>N/A<br><br>IBM PC/XT 1983   |
-| 84-Key AT<br>Model F      |    Yes     |     No<br>(kbdbabel.org)       |   i8048<br><a href="8048_AT_INTERN.TEXT">1503099</a>      |  8-sense<br>6014810<br>IBM 9314   |  16 x 8 = 128  |    i8042 AT<br><a href="8042_1503033.TXT">1503033</a><br><br>IBM PC/AT 1984     |
-| 101/102-Key<br>Model M    |    No      |     Yes      |   M6805<br>none      |  N/A       |  16 x 8 = 128  |    i8042 PS/2<br><a href="8042_PS2_INTERN.TEXT">72X8455</a><br><br>IBM PS/2 1987   |
+| IBM PC           | PC Controller/<br>2K ROM dump                                                 | IBM Keyboard                | Capacitive?<br>IBM SENSE<br>AMPLIFIER |  Schematics<br>IBM TechRef |  KB Controller/<br>1K ROM dump                  | Keyboard<br>Matrix = N |
+|------------------|-------------------------------------------------------------------------------|-----------------------------|---------------------------------------|----------------------------|-------------------------------------------------------|------------------------|
+|IBM PC<br>1981    | BIOS+LS322<br>N/A<br><br>IBM PC 1981                                          | 83-Key<br>Type-1<br>Model F | Yes<br>4-sense<br>5119699<br>IBM 14   |  Yes                       |   i8048<br>none                                       |  24 x 4 =  96          |
+|IBM PC/XT<br>1983 | BIOS+LS322<br>N/A<br><br>IBM PC/XT 1983                                       | 83-Key<br>Type-2<br>Model F | Yes<br>8-sense<br>8273565<br>IBM 9314 |  Yes                       |   i8048<br><a href="8048_XT_INTERN.TEXT">4584751</a>  |  12 x 8 =  96          |
+|IBM PC/AT<br>1984 | i8042 AT<br><a href="8042_1503033.TXT">1503033</a><br><br>IBM PC/AT 1984      | 84-Key AT<br>Model F        | Yes<br>8-sense<br>6014810<br>IBM 9314 |  No<br>(kbdbabel.org)      |   i8048<br><a href="8048_AT_INTERN.TEXT">1503099</a>  |  16 x 8 = 128          |
+|IBM PS/2<br>1987  | i8042 PS/2<br><a href="8042_PS2_INTERN.TEXT">72X8455</a><br><br>IBM PS/2 1987 | 101/102-Key<br>Model M      | No<br>N/A                             |  Yes                       |   M6805<br>none                                       |  16 x 8 = 128          |
